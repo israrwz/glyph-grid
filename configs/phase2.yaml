@@ -1,0 +1,218 @@
+# Phase 2 (Glyph Classification) Configuration
+# Aligned strictly with NEW_PLAN.md Sections 7.1–7.3
+# Purpose: Classify full glyphs from their 16x16 grid of primitive IDs (0..1023).
+# Pipeline assumption:
+#   - Phase 1 has produced: grids/<glyph_id>.u16 (shape 16x16), primitive_centroids.npy, label_map.json
+#   - Rasterization already applied scaling/diacritic heuristic; grids are row‑major, no cropping.
+#
+# Key Plan Points Incorporated:
+#   - Primitive embedding: Embedding(1024, 64)
+#   - 2D positional encoding (sinusoidal or learnable) added to embeddings
+#   - Transformer: 4–6 layers; choose 5 (midpoint), d_model=256, heads=8, MLP=512, dropout=0.1
+#   - Batch size: 128
+#   - Optimizer: AdamW lr=5e-4
+#   - Epochs: 30–50 → choose 40 baseline
+#   - Regularization: dropout 0.1, label smoothing 0.05
+#   - Optional auxiliary diacritic presence loss (disabled by default, weight=0.1 in plan suggestion)
+#
+# Omitted (not in plan): token masking, advanced sequence augmentations, extra special tokens.
+
+experiment:
+  name: phase2_transformer_baseline_v1
+  notes: >
+    Baseline lightweight transformer on primitive ID grids.
+    Embedding(1024,64) + 2D positional enc + 5-layer encoder (d_model=256).
+    Midpoint hyperparameters of specified plan ranges.
+
+seed: 42
+deterministic: true
+
+# ------------------------------------------------------------------
+# Data Paths
+# ------------------------------------------------------------------
+data:
+  root: data/processed
+  grids_dir: data/processed/grids # Each file: <glyph_id>.u16 (16x16, dtype=uint16 or uint16-cast)
+  labels_file: data/processed/label_map.json
+  index_train: data/processed/splits/phase2_train_ids.txt # List of glyph_ids
+  index_val: data/processed/splits/phase2_val_ids.txt
+  index_test: data/processed/splits/phase2_test_ids.txt
+  primitive_centroids: assets/centroids/primitive_centroids.npy # Shape: (1023,64) excluding empty or (1024,64) including empty (validate)
+  # Format expectations:
+  #   - label_map.json: { "label_string": class_index, ... } stable sorted order from preprocessing
+  #   - primitive_centroids: produced during K-Means (Section 6.1)
+
+# ------------------------------------------------------------------
+# Input Representation (Section 7.1)
+# ------------------------------------------------------------------
+input:
+  grid_rows: 16
+  grid_cols: 16
+  primitive_vocab_size: 1024 # IDs 0..1023 (0 = EMPTY)
+  embedding_dim: 64
+  positional_encoding: sinusoidal_2d # {sinusoidal_2d | learnable_2d}
+  combine_mode: add # How positional enc is merged with primitive embeddings
+  patch_grouping:
+    enabled: false # If true: group 4x4 → 64 tokens, each projected; disabled baseline
+    patch_rows: 4
+    patch_cols: 4
+  token_pooling: cls # {cls | mean}; plan allows global average OR CLS
+  use_cls_token: true # Adds an extra learnable CLS (sequence len = 256+1)
+  normalize_embeddings: false # L2 normalize embeddings (not in plan; default off)
+
+# ------------------------------------------------------------------
+# Model Definition (Section 7.2.A)
+# ------------------------------------------------------------------
+model:
+  architecture: transformer
+  transformer:
+    num_layers: 5 # Plan: 4–6 → picked midpoint
+    d_model: 256
+    num_heads: 8
+    mlp_hidden_dim: 512
+    dropout: 0.1
+    attention_dropout: 0.1
+    layer_norm_eps: 1.0e-5
+    pre_norm: true
+  classifier:
+    hidden_dim: 256 # Single linear if hidden_dim == d_model; can add MLP later
+    dropout: 0.1
+    activation: gelu
+  init:
+    embedding_from_centroids: true # Initialize primitive embeddings from centroids (row 0 for EMPTY as zeros)
+    centroid_requires_grad: true
+    cls_init: normal
+    weight_init: xavier_uniform
+
+# ------------------------------------------------------------------
+# Optimization & Training (Section 7.3)
+# ------------------------------------------------------------------
+optim:
+  name: adamw
+  lr: 0.0005 # Plan: 5e-4
+  weight_decay: 1.0e-4
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  grad_clip_norm: 1.0
+
+scheduler:
+  strategy: cosine # {cosine | plateau}; plan allows Cosine or ReduceLROnPlateau
+  min_lr_scale: 0.1 # final_lr = lr * min_lr_scale
+  warmup_epochs: 2 # Brief warmup
+  plateau: # Used only if strategy == plateau
+    metric: val/accuracy_top1
+    mode: max
+    factor: 0.5
+    patience: 3
+    min_lr: 1.0e-6
+
+training:
+  epochs: 40 # Plan: 30–50
+  batch_size: 128
+  eval_batch_size: 256
+  num_workers: 4
+  pin_memory: true
+  gradient_accumulation_steps: 1
+  log_interval_steps: 100
+  val_interval_epochs: 1
+  save_every_epochs: 1
+  mixed_precision: amp # {none | amp}
+
+early_stopping:
+  enabled: true
+  metric: val/accuracy_top1
+  mode: max
+  patience: 6
+  min_delta: 0.0005
+
+# ------------------------------------------------------------------
+# Loss Configuration
+# ------------------------------------------------------------------
+loss:
+  primary: cross_entropy
+  label_smoothing: 0.05
+  class_weights: null # Optional path to JSON {class_index: weight}
+  auxiliary_diacritic:
+    enabled: false # Optional auxiliary (Section 7.3 table, weight 0.1)
+    weight: 0.1
+    label_source: metadata # Where to read diacritic flag (metadata boolean)
+  reduction: mean
+
+# ------------------------------------------------------------------
+# Metrics (Section 8.2 subset relevant to phase)
+# ------------------------------------------------------------------
+metrics:
+  - accuracy_top1
+  - accuracy_top5
+  - macro_f1
+  - per_class_accuracy
+  - diacritic_subset_accuracy # accuracy restricted to glyphs is_diacritic=true
+  - ligature_subset_accuracy # if ligatures flagged; else ignore gracefully
+
+# ------------------------------------------------------------------
+# Checkpointing
+# ------------------------------------------------------------------
+checkpoint:
+  dir: checkpoints/phase2
+  monitor: val/accuracy_top1
+  mode: max
+  save_top_k: 3
+  save_last: true
+  filename_pattern: "epoch{epoch:02d}-val{val_accuracy_top1:.4f}.pt"
+  keep_every_n_epochs: 0
+
+# ------------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------------
+logging:
+  backend: tensorboard # {tensorboard | wandb | none}
+  tensorboard_dir: logs/phase2
+  run_name: "${experiment.name}"
+  log_hparams: true
+  wandb:
+    enabled: false
+    project: glyph-grid
+    tags: ["phase2", "transformer", "baseline"]
+
+# ------------------------------------------------------------------
+# Evaluation / Analysis Hooks
+# ------------------------------------------------------------------
+evaluation:
+  confusion_matrix: true
+  topk: [1, 5]
+  attention_heatmap:
+    enabled: true
+    sample_count: 50
+  export_embeddings:
+    enabled: false
+    layer: penultimate
+    path: artifacts/phase2_glyph_embeddings.npy
+
+# ------------------------------------------------------------------
+# Sanity & Validation
+# ------------------------------------------------------------------
+sanity:
+  expect_grid_shape: [16, 16]
+  primitive_vocab_size: 1024
+  embedding_dim: 64
+  d_model: 256
+  mlp_hidden_dim: 512
+  assert_cls_token: true
+
+# ------------------------------------------------------------------
+# Debug
+# ------------------------------------------------------------------
+debug:
+  fast_dev_run: false
+  limit_train_batches: null
+  limit_val_batches: null
+  overfit_batches: 0
+  deterministic_hash_check: false
+# ------------------------------------------------------------------
+# Notes
+# ------------------------------------------------------------------
+# - To try patch grouping (4x4→64 tokens), set patch_grouping.enabled: true and
+#   adjust use_cls_token if desired.
+# - If overfitting early, raise dropout to 0.15 or add stochastic depth.
+# - For larger experiments (d_model=320, num_layers=6) adjust batch size or use grad accumulation.
+# - Auxiliary diacritic loss can be enabled once metadata includes robust diacritic subtype flags.
