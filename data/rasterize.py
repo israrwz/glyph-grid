@@ -153,6 +153,8 @@ class RasterConfig:
     main_target_dim: int
     diacritic_target_dim: int
     diacritic_ratio_threshold: float
+    diacritic_advance_threshold: int
+    exclude_large_diacritics: bool
     fill_rule: str
     store_mode: str
     engine: str = "python"  # "python" or "cairo"
@@ -219,6 +221,10 @@ def load_config(path: str | Path) -> FullConfig:
             main_target_dim=int(raster["main_target_dim"]),
             diacritic_target_dim=int(raster["diacritic_target_dim"]),
             diacritic_ratio_threshold=float(raster["diacritic_ratio_threshold"]),
+            diacritic_advance_threshold=int(
+                raster.get("diacritic_advance_threshold", 100)
+            ),
+            exclude_large_diacritics=bool(raster.get("exclude_large_diacritics", True)),
             fill_rule=str(raster.get("fill_rule", "orientation")),
             store_mode=str(raster.get("store_mode", "binary_uint8")),
             engine=str(raster.get("engine", "python")),
@@ -282,6 +288,8 @@ def iter_glyph_rows(db_path: Path) -> Iterator[Dict[str, Any]]:
               g.glyph_id AS glyph_id,
               g.label    AS label,
               g.contours AS contours_json,
+              g.char_class AS char_class,
+              g.advance_width AS advance_width,
               COALESCE(f.typo_ascent, f.ascent)  AS used_ascent,
               COALESCE(f.typo_descent, f.descent) AS used_descent,
               f.file_hash AS font_hash,
@@ -1220,6 +1228,7 @@ def run_rasterization(cfg: FullConfig, limit: int | None = None):
     start_time = time.time()
     processed = 0
     skipped_empty = 0  # Count glyphs with zero vector subpaths (blank / unusable)
+    skipped_outlier = 0  # Count large diacritic outliers excluded from training
 
     for r in kept:
         # Use DB primary key 'id' for filenames; keep original glyph_id in metadata.
@@ -1230,11 +1239,48 @@ def run_rasterization(cfg: FullConfig, limit: int | None = None):
         used_ascent = r.get("used_ascent")
         used_descent = r.get("used_descent")
         font_hash = r.get("font_hash", "")
+        char_class = r.get("char_class", "")
+        advance_width = r.get("advance_width")
 
         subpaths = parse_contours(contours_json)
         if not subpaths:
             skipped_empty += 1
             continue
+
+        # Hybrid diacritic detection and outlier filtering
+        # First, compute ratio to determine if it's a diacritic
+        bounds_str = r.get("bounds")
+        if bounds_str:
+            try:
+                bounds = json.loads(bounds_str)
+                if bounds and len(bounds) == 4:
+                    min_x, min_y, max_x, max_y = bounds
+                    bbox_w = max_x - min_x
+                    bbox_h = max_y - min_y
+                    major_dim = max(bbox_w, bbox_h)
+
+                    em_height = (
+                        (used_ascent - used_descent)
+                        if (used_ascent and used_descent)
+                        else bbox_h
+                    )
+                    em_height = em_height if em_height != 0 else 1.0
+                    ratio = major_dim / em_height
+
+                    # Hybrid rule: is_diacritic = (advance_width < 100) OR (ratio < 0.15)
+                    adv = advance_width if advance_width is not None else 1000
+                    is_diacritic_by_metrics = (adv < 100) or (ratio < 0.15)
+                    is_diacritic_by_class = (
+                        "diacritic" in char_class.lower() if char_class else False
+                    )
+
+                    # Exclude large diacritic outliers from training
+                    # These are diacritics (by class) that are rendered unusually large
+                    if is_diacritic_by_class and (adv >= 100 and ratio >= 0.15):
+                        skipped_outlier += 1
+                        continue
+            except:
+                pass  # If bounds parsing fails, proceed with rasterization
 
         bitmap, meta = rasterize_glyph(subpaths, used_ascent, used_descent, cfg)
 
@@ -1263,11 +1309,11 @@ def run_rasterization(cfg: FullConfig, limit: int | None = None):
         if processed % 1000 == 0:
             elapsed = time.time() - start_time
             print(
-                f"[INFO] Processed {processed} glyphs (skipped empty: {skipped_empty}) in {elapsed:.1f}s"
+                f"[INFO] Processed {processed} glyphs (skipped empty: {skipped_empty}, outliers: {skipped_outlier}) in {elapsed:.1f}s"
             )
 
     print(
-        f"[INFO] Completed rasterization of {processed} glyphs. Skipped empty: {skipped_empty}. Elapsed {time.time() - start_time:.1f}s"
+        f"[INFO] Completed rasterization of {processed} glyphs. Skipped empty: {skipped_empty}, outliers: {skipped_outlier}. Elapsed {time.time() - start_time:.1f}s"
     )
 
 
