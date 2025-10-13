@@ -652,16 +652,9 @@ def rasterize_glyph_cairo(
     ss = cfg.raster.supersample_factor
     render_size = canvas_size * ss
 
-    # Create Cairo surface and context with ARGB32 for full antialiasing support
-    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, render_size, render_size)
+    # Create Cairo surface and context (FORMAT_A8 is sufficient for binary output)
+    surface = cairo.ImageSurface(cairo.FORMAT_A8, render_size, render_size)
     ctx = cairo.Context(surface)
-
-    # Clear background to transparent black
-    ctx.set_source_rgba(0, 0, 0, 0)
-    ctx.paint()
-
-    # Enable anti-aliasing for smooth edges
-    ctx.set_antialias(cairo.ANTIALIAS_BEST)
 
     # Set fill rule based on config
     fill_rule = getattr(cfg.raster, "fill_rule", "winding")
@@ -684,22 +677,15 @@ def rasterize_glyph_cairo(
         ctx.close_path()
 
     # Fill the path with white
-    ctx.set_source_rgba(1, 1, 1, 1)  # Opaque white
+    ctx.set_source_rgb(1, 1, 1)  # White
     ctx.fill()
 
-    # Get pixel data from Cairo surface (ARGB32 format)
+    # Get pixel data from Cairo surface
     buf = surface.get_data()
-    # ARGB32 is 4 bytes per pixel, we want the alpha channel (which contains our rendering)
-    img_arr = np.ndarray(
-        shape=(render_size, render_size, 4), dtype=np.uint8, buffer=buf
-    )
-
-    # Extract alpha channel (or red channel - both work since we filled with white)
-    # Cairo stores as BGRA on little-endian systems, so alpha is index 3
-    alpha_channel = img_arr[:, :, 3]
+    img_arr = np.ndarray(shape=(render_size, render_size), dtype=np.uint8, buffer=buf)
 
     # Downsample to final size using high-quality LANCZOS resampling
-    img = Image.fromarray(alpha_channel, mode="L")
+    img = Image.fromarray(img_arr, mode="L")
     if ss > 1:
         img = img.resize((canvas_size, canvas_size), Image.LANCZOS)
 
