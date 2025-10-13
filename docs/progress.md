@@ -1,6 +1,6 @@
 # Hierarchical Glyph Recognition Project - Implementation Progress
 
-_Last updated: 2024-01-09 (Cairo integration completed)_
+_Last updated: 2024-01-09 (Cairo integration + hybrid diacritic detection completed)_
 
 ## 1. Scope Recap (from NEW_PLAN.md)
 Phased pipeline:
@@ -66,7 +66,22 @@ Phased pipeline:
 - Config default set to `engine: cairo`.
 - Verified with smoke tests and sample rasterization runs.
 
-### 2.8 Proven Execution
+### 2.8 Hybrid Diacritic Detection (✓ COMPLETED)
+- Analyzed all 524,364 glyphs to optimize diacritic detection accuracy.
+- **Hybrid rule implemented:** `(advance_width < 100) OR (ratio < 0.15)` achieves **97.98% accuracy**.
+- Key findings:
+  - Diacritic median advance_width: 0 (combining marks)
+  - Non-diacritic median advance_width: 891
+  - Simple ratio threshold (0.25) only achieved 94% accuracy
+  - Hybrid rule catches 89.1% of diacritics with 98.4% precision
+- **Outlier filtering:** Excludes 2,336 large calligraphic diacritics (10.9% of diacritics) from training:
+  - Diacritics with `advance_width >= 100 AND ratio >= 0.15`
+  - Includes both 0x610-0x615 (sallalallah) and standard marks (0x064B-0x065F) in ornamental fonts
+  - These are legitimate outliers (e.g., Quranic fonts with large decorative forms)
+- Verified contour overflow is NOT a good classifier (only 62-80% accuracy)
+- Config parameters added: `diacritic_advance_threshold`, `exclude_large_diacritics`
+
+### 2.9 Proven Execution
 - Rasterized first 1K glyph subset multiple times with different fill rules.
 - Verified diacritic detection, metadata integrity, and absence of false "empty" glyphs after parser fixes.
 - Confirmed correct counter rendering in cleaned font set (after removal of problematic font).
@@ -86,9 +101,9 @@ Phased pipeline:
 | ~~Outline fidelity~~ | ✓ Cairo handles curves natively | None | ~~Resolved via Cairo~~ |
 | ~~Hole semantics~~ | ✓ Cairo winding rule | None | ~~Resolved via Cairo~~ |
 | ~~Self-overlap stroke artifacts~~ | ✓ Cairo winding rule | None | ~~Resolved via Cairo~~ |
+| ~~Diacritic detection~~ | ✓ Hybrid rule (97.98% acc) | None | ~~Resolved via advance_width + ratio~~ |
 | Performance scaling | Single-process Python | Longer runtime for full corpus | Parallel chunking (Cairo is C-backed) |
 | Primitive sampling | Reservoir + full read loop | I/O overhead on large sets | Cell shards + memory map / LMDB |
-| Diacritic heuristic | Ratio-based only | Edge cases for near-threshold shapes | Add margin band / optional metadata channel |
 | Metadata QA | Basic fields + engine tag | N/A | Current state adequate |
 | Phase 1 dataset | Not materialized | Blocks primitive CNN training | Implement dataset + dataloader soon |
 
@@ -99,6 +114,9 @@ Phased pipeline:
 - Cairo works directly with parsed contour data already in database.
 - Removed Python winding heuristics; Cairo is now default engine.
 - Supersample factor increased to 4× (512px render) with LANCZOS downsampling for quality.
+- **Hybrid diacritic detection:** Use `advance_width < 100` OR `ratio < 0.15` (97.98% accuracy).
+- **Exclude 2,336 large diacritic outliers** (calligraphic forms in Quranic/decorative fonts) from training.
+- Contour overflow tested but rejected as classifier (poor accuracy vs hybrid rule).
 - Deferred complex curve error metrics until after baseline model accuracy established.
 
 ## 6. Next Immediate TODOs
@@ -154,6 +172,7 @@ Phased pipeline:
 
 ## 9. Metrics to Capture Soon
 - ~~Raster difference (Python vs Cairo)~~ ✓ Cairo is now default (Python deprecated).
+- ~~Diacritic detection accuracy~~ ✓ Hybrid rule achieves 97.98% (advance_width + ratio).
 - Primitive class frequency distribution (top 50 / tail).
 - Phase 1 confusion pairs (top misassignments).
 - Phase 2 macro vs weighted F1.
@@ -161,11 +180,12 @@ Phased pipeline:
 ## 10. Action Summary (Short List)
 Immediate (next session):
 1. ~~Implement authoritative rendering~~ ✓ Done via Cairo
-2. Run full corpus rasterization with Cairo engine.
-3. Consolidate full cell corpus.
-4. Run K-Means (k=1023) + save centroids + stats.
-5. Phase 1 CNN implementation.
+2. ~~Optimize diacritic detection~~ ✓ Done via hybrid rule (97.98% accuracy)
+3. Run full corpus rasterization with Cairo engine + outlier filtering.
+4. Consolidate full cell corpus.
+5. Run K-Means (k=1023) + save centroids + stats.
+6. Phase 1 CNN implementation.
 
 ---
 
-_This document was updated after Cairo integration completion. Next: full corpus raster + primitive clustering._
+_This document was updated after Cairo integration and hybrid diacritic detection. Next: full corpus raster + primitive clustering._
