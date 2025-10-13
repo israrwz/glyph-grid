@@ -648,6 +648,9 @@ def rasterize_glyph_cairo(
     surface = cairo.ImageSurface(cairo.FORMAT_A8, render_size, render_size)
     ctx = cairo.Context(surface)
 
+    # Enable anti-aliasing for smooth edges
+    ctx.set_antialias(cairo.ANTIALIAS_BEST)
+
     # Set fill rule based on config
     fill_rule = getattr(cfg.raster, "fill_rule", "winding")
     if fill_rule == "even-odd":
@@ -676,10 +679,10 @@ def rasterize_glyph_cairo(
     buf = surface.get_data()
     img_arr = np.ndarray(shape=(render_size, render_size), dtype=np.uint8, buffer=buf)
 
-    # Downsample to final size using PIL
+    # Downsample to final size using high-quality LANCZOS resampling
     img = Image.fromarray(img_arr, mode="L")
     if ss > 1:
-        img = img.resize((canvas_size, canvas_size), Image.BICUBIC)
+        img = img.resize((canvas_size, canvas_size), Image.LANCZOS)
 
     arr = np.asarray(img, dtype=np.float32) / 255.0
     binary = (arr >= cfg.raster.binarize_threshold).astype(np.uint8) * 255
