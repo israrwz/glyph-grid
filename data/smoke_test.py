@@ -173,7 +173,13 @@ def smoke_raster_sample(
         # Ascent / descent provided via join inside iter_glyph_rows (used_ascent/used_descent).
         used_ascent = r.get("used_ascent")  # may be injected by future join
         used_descent = r.get("used_descent")
-        bitmap, meta = rasterize_glyph(subpaths, used_ascent, used_descent, cfg)
+        bitmap, meta = rasterize_glyph(
+            subpaths,
+            used_ascent,
+            used_descent,
+            cfg,
+            advance_width=r.get("advance_width"),
+        )
 
         # Assertions
         _assert(

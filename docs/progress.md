@@ -1,6 +1,6 @@
 # Hierarchical Glyph Recognition Project - Implementation Progress
 
-_Last updated: 2024-01-09 (Cairo integration + hybrid diacritic detection completed)_
+_Last updated: 2025-10-13 (Hybrid diacritic integration complete; next focus: Phase 1 training bootstrap & primitive pipeline)._
 
 ## 1. Scope Recap (from NEW_PLAN.md)
 Phased pipeline:
@@ -188,4 +188,4 @@ Immediate (next session):
 
 ---
 
-_This document was updated after Cairo integration and hybrid diacritic detection. Next: full corpus raster + primitive clustering._
+_This document was updated after Cairo integration and hybrid diacritic detection. Subsequent update (2025-10-13): clarified that the current 16×16 occupancy grid (single-bit per 8×8 cell) is an auxiliary coarse structural channel and is **not** used as the sole Phase 1 input because it irreversibly discards intra‑cell stroke geometry. Phase 1 will operate on the full 8×8 binary cell patches (retained via the 128×128 rasters) for primitive learning. Next immediate focus: (1) consolidate full cell corpus, (2) run K-Means to produce primitive centroids, (3) materialize Phase 1 dataset (cells → primitive IDs), and (4) implement & launch Phase 1 CNN training pipeline (bootstrap of end-to-end training)._

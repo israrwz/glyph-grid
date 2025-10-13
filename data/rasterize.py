@@ -300,10 +300,11 @@ def iter_glyph_rows(db_path: Path) -> Iterator[Dict[str, Any]]:
             JOIN fonts f ON f.file_hash = g.f_id
             WHERE g.contours IS NOT NULL
               AND g.has_contours != 0
-            GROUP BY g.glyph_id
-            ORDER BY g.glyph_id
+              AND label NOT LIKE '%_shaped'
+            ORDER BY g.id
             """
         )
+        # GROUP BY g.glyph_id
         for row in cur:
             yield dict(row)
     finally:
@@ -319,9 +320,9 @@ def build_label_whitelist(
     rows: Iterable[Dict[str, Any]], min_count: int, drop_shaped_variants: bool
 ) -> set[str]:
     freq: Dict[str, int] = {}
-    buffered = []
+    # buffered = []
     for r in rows:
-        buffered.append(r)
+        # buffered.append(r)
         label = r["label"]
         freq[label] = freq.get(label, 0) + 1
 
@@ -329,11 +330,7 @@ def build_label_whitelist(
         # Example suffixes (init/medi/final) - adapt as needed
         return label.endswith(("_init", "_medi", "_final"))
 
-    whitelist = {
-        l
-        for l, c in freq.items()
-        if c >= min_count and (not drop_shaped_variants or not is_shaped(l))
-    }
+    whitelist = {l for l, c in freq.items() if c >= min_count}
     return whitelist
 
 
@@ -576,6 +573,7 @@ def rasterize_glyph_cairo(
     used_ascent: float,
     used_descent: float,
     cfg: FullConfig,
+    advance_width: float | None = None,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     """
     Rasterize a glyph using Cairo for authoritative non-zero winding rule.
@@ -614,7 +612,10 @@ def rasterize_glyph_cairo(
     em_height = em_height if em_height != 0 else 1.0
     ratio = major_dim / em_height
 
-    is_diacritic = ratio < cfg.raster.diacritic_ratio_threshold
+    # Hybrid diacritic rule: (advance_width < adv_threshold) OR (ratio < ratio_threshold)
+    adv_threshold = getattr(cfg.raster, "diacritic_advance_threshold", 100)
+    adv_ok = (advance_width is not None) and (advance_width < adv_threshold)
+    is_diacritic = bool(adv_ok or (ratio < cfg.raster.diacritic_ratio_threshold))
     target_dim = (
         cfg.raster.diacritic_target_dim if is_diacritic else cfg.raster.main_target_dim
     )
@@ -709,6 +710,7 @@ def rasterize_glyph(
     used_ascent: float,
     used_descent: float,
     cfg: FullConfig,
+    advance_width: float | None = None,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     """
     Rasterize a glyph according to plan rules.
@@ -720,11 +722,14 @@ def rasterize_glyph(
       meta:   dict with fields required by Section 4.5
     """
     engine = getattr(cfg.raster, "engine", "python")
-
     if engine == "cairo":
-        return rasterize_glyph_cairo(subpaths, used_ascent, used_descent, cfg)
+        return rasterize_glyph_cairo(
+            subpaths, used_ascent, used_descent, cfg, advance_width=advance_width
+        )
     else:
-        return rasterize_glyph_python(subpaths, used_ascent, used_descent, cfg)
+        return rasterize_glyph_python(
+            subpaths, used_ascent, used_descent, cfg, advance_width=advance_width
+        )
 
 
 def rasterize_glyph_python(
@@ -732,6 +737,7 @@ def rasterize_glyph_python(
     used_ascent: float,
     used_descent: float,
     cfg: FullConfig,
+    advance_width: float | None = None,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     """
     Rasterize a glyph using Python/PIL implementation.
@@ -766,7 +772,10 @@ def rasterize_glyph_python(
     em_height = em_height if em_height != 0 else 1.0
     ratio = major_dim / em_height
 
-    is_diacritic = ratio < cfg.raster.diacritic_ratio_threshold
+    # Hybrid diacritic rule: (advance_width < adv_threshold) OR (ratio < ratio_threshold)
+    adv_threshold = getattr(cfg.raster, "diacritic_advance_threshold", 100)
+    adv_ok = (advance_width is not None) and (advance_width < adv_threshold)
+    is_diacritic = bool(adv_ok or (ratio < cfg.raster.diacritic_ratio_threshold))
     target_dim = (
         cfg.raster.diacritic_target_dim if is_diacritic else cfg.raster.main_target_dim
     )
@@ -1279,18 +1288,26 @@ def run_rasterization(cfg: FullConfig, limit: int | None = None):
             except:
                 pass  # If bounds parsing fails, proceed with rasterization
 
-        bitmap, meta = rasterize_glyph(subpaths, used_ascent, used_descent, cfg)
+        bitmap, meta = rasterize_glyph(
+            subpaths, used_ascent, used_descent, cfg, advance_width=advance_width
+        )
 
         # Inject original glyph_id for traceability
         meta["orig_glyph_id"] = orig_glyph_id
 
         # Save raster named by DB primary key id
-        raster_path = cfg.paths.rasters_dir / f"{db_id}.png"
+        import re  # local import for filename sanitization
+
+        safe_label = re.sub(r"[^A-Za-z0-9._-]+", "_", label)[:64]
+        raster_path = cfg.paths.rasters_dir / f"{safe_label}_{db_id}.png"
         Image.fromarray(bitmap, mode="L").save(
             raster_path,
             optimize=True,
             compress_level=cfg.raster.store_mode == "binary_uint8",
         )
+
+        # Record raster filename for reverse lookup in metadata
+        meta["raster_filename"] = raster_path.name
 
         # Extract & save occupancy grid (also keyed by DB id)
         grid = extract_cell_grid(bitmap, cfg)

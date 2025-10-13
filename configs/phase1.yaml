@@ -40,11 +40,13 @@ data:
   cell_size: 8
   channels: 1
   # Splits (lists of cell_ids) produced deterministically from font splits.
-  train_split: data/splits/phase1_train_cells.txt
-  val_split: data/splits/phase1_val_cells.txt
-  test_split: data/splits/phase1_test_cells.txt
+  train_split: data/processed/cells/phase1_train_cells.txt
+  val_split: data/processed/cells/phase1_val_cells.txt
+  test_split: data/processed/cells/phase1_test_cells.txt
   # Class 0 reserved for empty cell (all zeros).
   empty_class_id: 0
+  # Downsampling ratio for empty cells in TRAIN split only (0,1]; validation/test keep all empties.
+  empty_sampling_ratio: 0.1
 
 # ------------------------------------------------------------------
 # Vocabulary
@@ -130,7 +132,7 @@ training:
     min_delta: 0.0005
     monitor: val/accuracy_top1
     mode: max
-  log_interval_batches: 50
+  log_interval_batches: 1
   validate_every_epochs: 1
   gradient_clip_norm: 5.0
   mixed_precision: true
@@ -182,6 +184,21 @@ logging:
     enabled: false
     project: glyph-grid
     tags: ["phase1", "baseline"]
+
+# ------------------------------------------------------------------
+# Misclassified Rendering (Phase 1 diagnostics)
+# ------------------------------------------------------------------
+misclassified_render:
+  enabled: true # If true, render a composite image for each misclassified sample (pred vs target)
+  output_dir: logs/phase1_misclassified
+  max_samples_per_epoch: 50
+  layout: horizontal # horizontal | vertical
+  scale: 16 # Each 8x8 cell scaled by this factor (16 -> 128x128)
+  gap_px: 8 # Pixel gap between the two panels
+  bg_value: 0 # Background grayscale value
+  fg_value: 255 # Foreground grayscale value
+  annotate: true # Draw text labels (pred/target) if PIL font available
+  font_size: 14 # Annotation font size (ignored if annotate=false)
 
 # ------------------------------------------------------------------
 # Evaluation / Export

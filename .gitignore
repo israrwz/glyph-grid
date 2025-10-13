@@ -4,3 +4,8 @@
 **/.DS_Store
 /data/rasters*
 /data/grids*
+/logs
+/data/processed*
+/data/recons*
+/checkpoints
+/assets
