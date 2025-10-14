@@ -866,6 +866,7 @@ def train_phase1(cfg: TrainConfig) -> None:
     ckpt_dir = Path(cfg.checkpoint.get("dir", "checkpoints/phase1"))
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     save_top_k = int(cfg.checkpoint.get("save_top_k", 3))
+    save_last = bool(cfg.checkpoint.get("save_last", False))
     top_checkpoints: List[Tuple[float, Path]] = []
 
     # Logging
@@ -1218,6 +1219,36 @@ def train_phase1(cfg: TrainConfig) -> None:
         except Exception as e:
             print(f"[EXPORT][WARN] TorchScript export failed: {e}")
 
+    # Optionally save "last" checkpoint regardless of rank
+    if "val_stats" in locals() and save_last:
+        last_path = ckpt_dir / "last.pt"
+        try:
+            save_checkpoint(
+                last_path,
+                model,
+                optimizer,
+                epoch,
+                {
+                    "val_accuracy_top1": val_stats.get("accuracy_top1"),
+                    "val_loss": val_stats.get("loss"),
+                },
+            )
+            print(f"[CHECKPOINT] Saved last checkpoint to {last_path}", flush=True)
+        except Exception as e:
+            print(
+                f"[CHECKPOINT][warn] Failed to save last checkpoint: {e}",
+                file=sys.stderr,
+            )
+    # Summary of kept top-K
+    if top_checkpoints:
+        kept_summary = ", ".join(
+            f"{p.name}:{acc:.4f}"
+            for acc, p in sorted(top_checkpoints, key=lambda x: x[0], reverse=True)
+        )
+        print(
+            f"[CHECKPOINT] Kept top-{min(len(top_checkpoints), save_top_k)}: {kept_summary}",
+            flush=True,
+        )
     print("[DONE] Phase 1 training complete.")
 
 
