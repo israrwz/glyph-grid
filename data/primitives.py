@@ -264,19 +264,39 @@ def sample_non_empty_cells(
 
 def run_kmeans(vectors: np.ndarray, cfg: KMeansConfig) -> np.ndarray:
     """
-    Run MiniBatchKMeans on provided vectors (N,64). Returns centroids array shape (k, 64).
+    Overcluster + refine strategy (default):
+      1. Overcluster with MiniBatchKMeans (k_init = ceil(k_target * 1.15))
+      2. Remove low-population and near-duplicate centroids
+      3. If too many survivors -> prune by population
+      4. If too few -> add back best remaining or (last resort) noisy copies
+      5. Return exactly cfg.k centroids (float32, shape (k,64))
+
+    Rationale: ensures final 1023 non-empty primitive classes (plus empty externally)
+    are fully utilized and reduces wasted slots due to zero-pop or duplicate clusters.
     """
     if MiniBatchKMeans is None:
         raise ImportError(
             "scikit-learn is required for MiniBatchKMeans (pip install scikit-learn)."
         )
 
+    import math
+
+    k_target = cfg.k
+    overcluster_margin = 0.15  # 15% headroom
+    k_init = int(math.ceil(k_target * (1.0 + overcluster_margin)))
+    dup_thresh = 0.22  # squared L2 duplicate threshold (tunable)
+    # Minimum population threshold relative to expected cluster size
+    expected = max(1, len(vectors) / max(1, k_init))
+    min_pop_sample = max(10, int(0.2 * expected))  # at least 20% of expected size
+
     print(
-        f"[kmeans] Starting MiniBatchKMeans: k={cfg.k}, samples={len(vectors):,}",
+        f"[kmeans] Overcluster pass: target={k_target} k_init={k_init} samples={len(vectors):,} "
+        f"min_pop_sample={min_pop_sample}",
         file=sys.stderr,
     )
+
     mbk = MiniBatchKMeans(
-        n_clusters=cfg.k,
+        n_clusters=k_init,
         init="k-means++",
         batch_size=cfg.batch_size,
         max_iter=cfg.max_iter,
@@ -285,22 +305,86 @@ def run_kmeans(vectors: np.ndarray, cfg: KMeansConfig) -> np.ndarray:
         verbose=0,
     )
     start = time.time()
-    mbk.fit(vectors)
+    labels = mbk.fit_predict(vectors)
     dt = time.time() - start
-    print(
-        f"[kmeans] Completed in {dt:.2f}s. Inertia={mbk.inertia_:.4f}", file=sys.stderr
-    )
-    centroids = mbk.cluster_centers_.astype(np.float32)
+    centroids_full = mbk.cluster_centers_.astype(np.float32)
+    counts = np.bincount(labels, minlength=k_init)
 
-    # Sanity check: ensure centroids are 0..1 range (they should reflect average of binary vectors)
-    if centroids.min() < -1e-3 or centroids.max() > 1.0 + 1e-3:
+    print(
+        f"[kmeans] Initial overcluster done in {dt:.2f}s | inertia={mbk.inertia_:.4f} "
+        f"| zero-pop={int((counts == 0).sum())}",
+        file=sys.stderr,
+    )
+
+    # Compute nearest-neighbor squared distances between centroids
+    norms = (centroids_full**2).sum(axis=1, keepdims=True)
+    d2 = norms + norms.T - 2 * (centroids_full @ centroids_full.T)
+    np.fill_diagonal(d2, np.inf)
+    nn_d2 = d2.min(axis=1)
+
+    # Initial survivor mask: keep those with adequate population AND not near-duplicate
+    survivor_mask = (counts >= min_pop_sample) & (nn_d2 > dup_thresh)
+
+    # Guarantee at least some survivors even if thresholds too strict
+    if survivor_mask.sum() == 0:
         print(
-            "[kmeans][warn] Centroid range outside expected bounds "
-            f"({centroids.min():.4f}, {centroids.max():.4f})",
+            "[kmeans][warn] Thresholds eliminated all clusters; relaxing criteria.",
+            file=sys.stderr,
+        )
+        # Keep top k_target by population
+        top_idx = np.argsort(counts)[-k_target:]
+        survivor_mask[top_idx] = True
+
+    survivors = np.where(survivor_mask)[0].tolist()
+
+    # If still too many survivors, prune smallest populations until k_target
+    if len(survivors) > k_target:
+        survivors.sort(key=lambda i: counts[i])  # ascending pop
+        survivors = survivors[-k_target:]
+
+    # If too few, add back best remaining (by count) ignoring dup filter first
+    if len(survivors) < k_target:
+        deficit = k_target - len(survivors)
+        remaining = [i for i in range(k_init) if i not in survivors and counts[i] > 0]
+        remaining.sort(key=lambda i: (counts[i], -nn_d2[i]))  # prefer higher count
+        add_list = remaining[-deficit:]
+        survivors.extend(add_list)
+
+    # Last resort: synthesize noisy copies if still short (should be rare)
+    rng = np.random.default_rng(cfg.seed)
+    while len(survivors) < k_target:
+        base = rng.choice(survivors)
+        noisy = centroids_full[base] + rng.normal(0, 0.02, size=centroids_full.shape[1])
+        noisy = np.clip(noisy, 0.0, 1.0)
+        centroids_full = np.vstack([centroids_full, noisy.astype(np.float32)])
+        survivors.append(len(centroids_full) - 1)
+
+    # Assemble final centroid set
+    final_centroids = centroids_full[survivors][:k_target]
+
+    # Sanity checks
+    if final_centroids.shape[0] != k_target:
+        print(
+            f"[kmeans][warn] Final centroid count mismatch: {final_centroids.shape[0]} != {k_target}",
             file=sys.stderr,
         )
 
-    return centroids
+    if final_centroids.min() < -1e-3 or final_centroids.max() > 1.0 + 1e-3:
+        print(
+            "[kmeans][warn] Centroid range outside expected bounds "
+            f"({final_centroids.min():.4f}, {final_centroids.max():.4f})",
+            file=sys.stderr,
+        )
+
+    print(
+        f"[kmeans] Refined centroids: kept={len(survivors)} "
+        f"| duplicates_removed={(k_init - len(survivors)) - int((counts == 0).sum())} "
+        f"| zero_pop={(counts == 0).sum()} "
+        f"| final_k={final_centroids.shape[0]}",
+        file=sys.stderr,
+    )
+
+    return final_centroids.astype(np.float32)
 
 
 def save_centroids_with_empty(centroids: np.ndarray, out_path: Path):
