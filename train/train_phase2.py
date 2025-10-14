@@ -527,6 +527,19 @@ def build_loss(cfg: Dict[str, Any]) -> nn.Module:
 
 
 # ---------------------------------------------------------------------------
+# Global collate function (pickle-safe for DataLoader workers)
+# ---------------------------------------------------------------------------
+def collate_grids(batch):
+    grids, labels, gids, dia = zip(*batch)
+    return (
+        torch.stack(grids, dim=0),
+        torch.tensor(labels, dtype=torch.long),
+        torch.tensor(gids, dtype=torch.long),
+        torch.tensor(dia, dtype=torch.bool),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main Training Orchestration
 # ---------------------------------------------------------------------------
 
@@ -615,14 +628,7 @@ def train_phase2(cfg: Phase2Config):
         diacritic_flags if track_diacritic else None,
     )
 
-    def collate(batch):
-        grids, labels, gids, dia = zip(*batch)
-        return (
-            torch.stack(grids, dim=0),
-            torch.tensor(labels, dtype=torch.long),
-            torch.tensor(gids, dtype=torch.long),
-            torch.tensor(dia, dtype=torch.bool),
-        )
+    # Local collate removed; using top-level collate_grids for multiprocessing safety.
 
     train_loader = DataLoader(
         train_ds,
@@ -630,7 +636,7 @@ def train_phase2(cfg: Phase2Config):
         shuffle=True,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        collate_fn=collate,
+        collate_fn=collate_grids,
     )
     val_loader = DataLoader(
         val_ds,
@@ -638,7 +644,7 @@ def train_phase2(cfg: Phase2Config):
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        collate_fn=collate,
+        collate_fn=collate_grids,
     )
     test_loader = DataLoader(
         test_ds,
@@ -646,7 +652,7 @@ def train_phase2(cfg: Phase2Config):
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        collate_fn=collate,
+        collate_fn=collate_grids,
     )
 
     # Model
@@ -872,7 +878,7 @@ def train_phase2(cfg: Phase2Config):
             f"Train: loss={train_loss:.4f} acc@1={train_acc1:.4f} "
             f"| Val: loss={val_stats['loss']:.4f} acc@1={val_stats['accuracy_top1']:.4f} acc@5={val_stats['accuracy_top5']:.4f} "
             f"macroF1={(macro_f1 or 0):.4f} "
-            f"{'(dia=' + f'{val_stats.get("diacritic_subset_accuracy", 0.0):.4f}' + ')' if track_diacritic else ''} "
+            f"{'(dia=' + format(val_stats.get('diacritic_subset_accuracy', 0.0), '.4f') + ')' if track_diacritic else ''} "
             f"| lr={current_lr:.3e} time={epoch_time:.1f}s",
             flush=True,
         )
@@ -949,7 +955,7 @@ def train_phase2(cfg: Phase2Config):
     print(
         f"[TEST] loss={test_stats['loss']:.4f} acc@1={test_stats['accuracy_top1']:.4f} "
         f"acc@5={test_stats['accuracy_top5']:.4f} macroF1={(macro_f1_test or 0):.4f} "
-        f"{'(dia=' + f'{test_stats.get("diacritic_subset_accuracy", 0.0):.4f}' + ')' if track_diacritic else ''}",
+        f"{'(dia=' + format(test_stats.get('diacritic_subset_accuracy', 0.0), '.4f') + ')' if track_diacritic else ''}",
         flush=True,
     )
 
