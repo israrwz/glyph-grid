@@ -102,6 +102,14 @@ except ImportError as e:
         "Could not import phase2 transformer model. Ensure PYTHONPATH includes project root."
     ) from e
 
+# Optional CNN import (only needed if architecture == 'cnn'); delay errors until selected.
+try:
+    from models.phase2_cnn import build_phase2_cnn_model  # type: ignore
+
+    _PHASE2_CNN_AVAILABLE = True
+except Exception:
+    _PHASE2_CNN_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # Config dataclass
 # ---------------------------------------------------------------------------
@@ -667,9 +675,24 @@ def train_phase2(cfg: Phase2Config):
             centroids_array = np.load(centroid_path)
         except Exception as e:
             print(f"[warn] Failed loading centroids: {e}", file=sys.stderr)
-    model = build_phase2_model(
-        cfg.raw, num_labels=num_labels, primitive_centroids=centroids_array
-    )
+    # ------------------------------------------------------------------
+    # Model (branch on architecture)
+    # ------------------------------------------------------------------
+    architecture = (cfg.get("model", "architecture") or "transformer").lower()
+    if architecture == "cnn":
+        if not _PHASE2_CNN_AVAILABLE:
+            raise RuntimeError(
+                "Requested model.architecture=cnn but phase2_cnn module not available."
+            )
+        model = build_phase2_cnn_model(
+            cfg.raw, num_labels=num_labels, primitive_centroids=centroids_array
+        )
+        print("[INFO] Using Phase 2 CNN architecture", flush=True)
+    else:
+        model = build_phase2_model(
+            cfg.raw, num_labels=num_labels, primitive_centroids=centroids_array
+        )
+        print("[INFO] Using Phase 2 Transformer architecture", flush=True)
     model.to(device)
 
     # Loss / Optim / Scheduler
@@ -1030,11 +1053,17 @@ def train_phase2(cfg: Phase2Config):
             last_path,
             model,
             optimizer,
-            epoch,
+            locals().get("epoch", 0),
             {
-                "val_accuracy_top1": val_stats["accuracy_top1"],
-                "val_loss": val_stats["loss"],
-                "test_accuracy_top1": test_stats["accuracy_top1"],
+                "val_accuracy_top1": (
+                    val_stats["accuracy_top1"]
+                    if "val_stats" in locals()
+                    else float("nan")
+                ),
+                "val_loss": (
+                    val_stats["loss"] if "val_stats" in locals() else float("nan")
+                ),
+                "test_accuracy_top1": test_stats.get("accuracy_top1", 0.0),
             },
             scheduler=scheduler,
         )
