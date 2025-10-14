@@ -96,10 +96,18 @@ def load_centroids(path: Path) -> np.ndarray:
 
 
 def load_model(checkpoint_path: Path, num_classes: int = 1024) -> torch.nn.Module:
+    """
+    Load a Phase 1 CNN checkpoint, robust to different wrapping conventions:
+      - {'model_state': ...}
+      - {'model_state_dict': ...}
+      - raw state_dict (keys like 'features.0.weight', 'classifier.4.bias', ...)
+    Falls back to raising a descriptive error if none of these patterns match.
+    """
     if build_phase1_model is None:
         raise RuntimeError(
             "Could not import build_phase1_model. Ensure PYTHONPATH includes project root."
         )
+
     cfg = {
         "in_channels": 1,
         "num_classes": num_classes,
@@ -124,11 +132,38 @@ def load_model(checkpoint_path: Path, num_classes: int = 1024) -> torch.nn.Modul
         "flatten_dim": 256,
         "fc_hidden": 128,
         "fc_dropout": 0.2,
-        "weight_init": "none",  # Will be overwritten by checkpoint weights
+        "weight_init": "none",  # We will overwrite with checkpoint weights
     }
     model = build_phase1_model(cfg)
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
-    state_dict = ckpt.get("model_state_dict") or ckpt
+
+    raw = torch.load(checkpoint_path, map_location="cpu")
+
+    # Determine actual state_dict
+    if isinstance(raw, dict):
+        if "model_state" in raw and isinstance(raw["model_state"], dict):
+            state_dict = raw["model_state"]
+        elif "model_state_dict" in raw and isinstance(raw["model_state_dict"], dict):
+            state_dict = raw["model_state_dict"]
+        else:
+            # Heuristic: does this look like a raw state_dict (contains parameter tensors)?
+            param_like_keys = [
+                k
+                for k in raw.keys()
+                if isinstance(k, str) and ("features." in k or "classifier." in k)
+            ]
+            if param_like_keys:
+                state_dict = raw  # treat as direct state_dict
+            else:
+                raise RuntimeError(
+                    f"Unrecognized checkpoint format. Keys: {list(raw.keys())[:10]}. "
+                    "Expected 'model_state', 'model_state_dict', or direct parameter tensors."
+                )
+    else:
+        raise RuntimeError(
+            f"Unsupported checkpoint object type: {type(raw)} (expected dict)."
+        )
+
+    # Load (strict True to catch architecture mismatches; relax if user requests)
     model.load_state_dict(state_dict, strict=True)
     model.eval()
     return model
