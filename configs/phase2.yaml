@@ -122,9 +122,8 @@ optim:
   grad_clip_norm: 1.0
 
 scheduler:
-  strategy: cosine # {cosine | plateau}; plan allows Cosine or ReduceLROnPlateau
-  min_lr_scale: 0.1 # final_lr = lr * min_lr_scale
-  warmup_epochs: 2 # Brief warmup
+  strategy: plateau # {cosine | plateau}; plan allows Cosine or ReduceLROnPlateau
+
   plateau: # Used only if strategy == plateau
     metric: val/accuracy_top1
     mode: max
@@ -133,6 +132,12 @@ scheduler:
     min_lr: 1.0e-6
 
 training:
+  unweighted_finetune_after_epoch: 19
+  # (REMINDER) At/after this epoch:
+  #   - set loss.class_weights: null
+  #   - remove class_weights_alpha
+  #   - set token_id_dropout: 0
+  #   - optionally reduce LR again if not yet decayed
   epochs: 40 # Plan: 30–50
   batch_size: 256 # 128
   eval_batch_size: 256 # 256
@@ -145,7 +150,7 @@ training:
   save_every_epochs: 1
   mixed_precision: amp # {none | amp}
   # resume_from: null # path to checkpoint to resume (or set via PHASE2_RESUME env var)
-  resume_from: checkpoints/phase2/epoch12-val0.6824.pt
+  resume_from: checkpoints/phase2/best.pt
 
 early_stopping:
   enabled: true
@@ -161,7 +166,7 @@ loss:
   primary: cross_entropy
   label_smoothing: 0.05
   class_weights: auto_inverse_freq # enabled auto inverse frequency weights
-  class_weights_alpha: 0.4
+  class_weights_alpha: 0.3
   auxiliary_diacritic:
     enabled: false # Optional auxiliary (Section 7.3 table, weight 0.1)
     weight: 0.1

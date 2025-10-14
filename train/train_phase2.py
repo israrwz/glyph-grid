@@ -712,16 +712,16 @@ def train_phase2(cfg: Phase2Config):
     class_weight_mode = (
         loss_cfg.get("class_weights") if isinstance(loss_cfg, dict) else None
     ) or None
+    # Build frequency map from training glyph IDs (needed for diagnostics even if not weighting)
+    class_counts = torch.zeros(num_labels, dtype=torch.float)
+    for gid in train_ids:
+        label_str = glyph_to_label.get(gid)
+        if label_str is None:
+            continue
+        idx = label_map.get(label_str)
+        if idx is not None:
+            class_counts[idx] += 1
     if class_weight_mode == "auto_inverse_freq":
-        # Build frequency map from training glyph IDs
-        class_counts = torch.zeros(num_labels, dtype=torch.float)
-        for gid in train_ids:
-            label_str = glyph_to_label.get(gid)
-            if label_str is None:
-                continue
-            idx = label_map.get(label_str)
-            if idx is not None:
-                class_counts[idx] += 1
         eps = 1.0
         total = class_counts.sum().item()
         alpha = float(loss_cfg.get("class_weights_alpha", 0.4))
@@ -765,6 +765,11 @@ def train_phase2(cfg: Phase2Config):
     limit_train_batches = training_cfg.get("limit_train_batches", None)
     # Token ID dropout probability (randomly replace primitive IDs with 0 / EMPTY during training)
     token_id_dropout = float(training_cfg.get("token_id_dropout", 0.0) or 0.0)
+    # Automatic unweighted fine-tune epoch (switch off class weights & token dropout)
+    unweighted_finetune_epoch = int(
+        training_cfg.get("unweighted_finetune_after_epoch", -1) or -1
+    )
+    fine_tune_switched = False  # guarded inside loop
     # Resume support (path or env var PHASE2_RESUME)
     resume_from = training_cfg.get("resume_from") or os.environ.get("PHASE2_RESUME")
     if isinstance(limit_train_batches, float) and 0 < limit_train_batches <= 1:
@@ -1035,6 +1040,40 @@ def train_phase2(cfg: Phase2Config):
                     f"acc_hist={bin_counts}",
                     flush=True,
                 )
+                # Head / Tail diagnostics (frequency deciles)
+                try:
+                    # Determine decile size
+                    decile = max(1, num_labels // 10)
+                    # Sort by training frequency
+                    freq_sorted, idx_sorted = torch.sort(class_counts)
+                    tail_idx = idx_sorted[:decile]
+                    head_idx = idx_sorted[-decile:]
+                    # Accuracy per class already in acc_per_class
+                    head_acc = acc_per_class[head_idx]
+                    tail_acc = acc_per_class[tail_idx]
+                    # Filter only seen classes for tail to avoid div-by-zero bias
+                    head_mean = (
+                        head_acc[head_acc > 0].mean().item()
+                        if (head_acc > 0).any()
+                        else 0.0
+                    )
+                    tail_mean = (
+                        tail_acc[tail_acc > 0].mean().item()
+                        if (tail_acc > 0).any()
+                        else 0.0
+                    )
+                    head_freq_mean = class_counts[head_idx].mean().item()
+                    tail_freq_mean = class_counts[tail_idx].mean().item()
+                    print(
+                        f"[VAL][diag2] head_acc={head_mean:.3f} tail_acc={tail_mean:.3f} "
+                        f"head_freq_mean={head_freq_mean:.1f} tail_freq_mean={tail_freq_mean:.1f}",
+                        flush=True,
+                    )
+                except Exception as e_head_tail:
+                    print(
+                        f"[warn] head/tail diagnostics failed: {e_head_tail}",
+                        file=sys.stderr,
+                    )
             except Exception as diag_e:
                 print(f"[warn] diagnostics failed: {diag_e}", file=sys.stderr)
 
@@ -1118,6 +1157,24 @@ def train_phase2(cfg: Phase2Config):
         else:
             if monitored_value < best_score - min_delta:
                 improved = True
+
+        # Automatic unweighted fine-tune switch (executed once)
+        if (
+            not locals().get("fine_tune_switched", False)
+            and unweighted_finetune_epoch >= 0
+            and epoch == unweighted_finetune_epoch
+        ):
+            # Rebuild plain (unweighted) loss with same smoothing
+            smoothing = float(loss_cfg.get("label_smoothing", 0.0) or 0.0)
+            loss_fn = torch.nn.CrossEntropyLoss(
+                label_smoothing=smoothing if smoothing > 0 else 0.0
+            )
+            token_id_dropout = 0.0
+            fine_tune_switched = True
+            print(
+                f"[FINETUNE] Switched to unweighted loss & token_id_dropout=0.0 at epoch {epoch}",
+                flush=True,
+            )
 
         if improved:
             best_score = monitored_value
