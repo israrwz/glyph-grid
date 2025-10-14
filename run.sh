@@ -2,31 +2,33 @@
 #
 # run.sh
 #
-# End‑to‑end Phase 1 pipeline orchestrator for the glyph-grid project.
+# End‑to‑end Phase 1 + early Phase 2 artifact pipeline orchestrator for the glyph-grid project.
 #
 # Steps:
-#   1. Rasterize first N glyphs (default: 20,000) using Cairo engine.
-#   2. Extract 8×8 cells + build font‑based train/val/test splits.
-#   3. K‑Means (sample up to 1M non‑empty cells) → centroids (k=1023 + empty).
-#   4. Assign every cell to nearest centroid.
-#   5. (Optional) Primitive frequency statistics.
-#   6. Train Phase 1 CNN (primitive classifier).
-#   7. (Optional) Overlay visualization on unseen glyphs (Phase 1 centroid coverage QA).
+#   1. rasterize      : Rasterize first N glyphs (default: 20,000) using Cairo engine.
+#   2. extract        : Extract 8×8 cells + build font‑based train/val/test splits.
+#   3. kmeans         : K‑Means (sample up to 1M non‑empty cells) → centroids (k=1023 + empty).
+#   4. assign         : Assign every cell to nearest centroid.
+#   5. stats          : Primitive frequency statistics (optional).
+#   6. train          : Train Phase 1 CNN (primitive classifier).
+#   7. overlay        : Overlay visualization on unseen glyphs (Phase 1 centroid coverage QA).
+#   8. export_grids   : (Phase 2 prep) Build per‑glyph 16×16 primitive ID grids + label_map + glyph splits.
+#   9. phase2_attn    : (Phase 2 interpretability) Generate transformer attention heatmaps (requires Phase 2 checkpoint; skipped if absent).
 #
 # Each step is idempotent where possible (skips if expected outputs already exist)
 # unless --force is provided.
 #
 # Usage:
-#   ./run.sh                      # run full pipeline with defaults
-#   ./run.sh --limit 5000         # only rasterize first 5k glyphs
-#   ./run.sh --no-train           # stop after assignments
-#   ./run.sh --force              # re-run all steps (overwrite)
-#   ./run.sh --skip <step>        # skip a named step (can repeat)
-#                                  steps: rasterize, extract, kmeans, assign, stats, train, overlay
-#   ./run.sh --only <step>        # run only the named step (ignores others & --no-train)
-#                                  (valid for --only / --skip: rasterize, extract, kmeans, assign, stats, train, overlay)
+#   ./run.sh                            # run full pipeline with defaults (Phase 1 + export_grids + phase2_attn if possible)
+#   ./run.sh --limit 5000               # only rasterize first 5k glyphs
+#   ./run.sh --no-train                 # stop after assignments (still can export_grids if requested explicitly)
+#   ./run.sh --force                    # re-run all steps (overwrite)
+#   ./run.sh --skip <step>              # skip a named step (repeatable)
+#                                       # steps: rasterize, extract, kmeans, assign, stats, train, overlay, export_grids, phase2_attn
+#   ./run.sh --only <step>              # run only the named step (ignores others & --no-train)
+#                                       # valid: rasterize, extract, kmeans, assign, stats, train, overlay, export_grids, phase2_attn
 #
-#   ./run.sh --dry-run            # print the commands without executing
+#   ./run.sh --dry-run                  # print the commands without executing
 #
 # Environment overrides (optional):
 #   GLYPH_LIMIT=25000 ./run.sh
@@ -50,6 +52,7 @@ TEST_RATIO="${TEST_RATIO:-0.1}"
 # Paths (relative to repo root)
 RASTER_CONFIG="configs/rasterizer.yaml"
 PHASE1_CONFIG="configs/phase1.yaml"
+PHASE2_CONFIG="configs/phase2.yaml"  # Needed for attention heatmap (model architecture)
 
 RASTERS_DIR="data/rasters"
 METADATA_FILE="${RASTERS_DIR}/metadata.jsonl"
@@ -58,6 +61,11 @@ CELLS_OUT_DIR="data/processed/cells"
 CENTROIDS_OUT="assets/centroids/primitive_centroids.npy"
 ASSIGNMENTS_FILE="data/processed/primitive_assignments.parquet"
 PRIMITIVE_STATS="data/processed/primitive_stats.json"
+PHASE2_OUT_ROOT="data/processed"
+PHASE2_GRIDS_DIR="${PHASE2_OUT_ROOT}/grids"
+PHASE2_LABEL_MAP="${PHASE2_OUT_ROOT}/label_map.json"
+PHASE2_SPLITS_DIR="${PHASE2_OUT_ROOT}/splits"
+PHASE2_ATTN_OUT="output/phase2_attn"
 
 # Skip & force flags
 FORCE=0
@@ -240,6 +248,72 @@ step_train() {
   log "Phase 1 training finished."
 }
 
+step_export_grids() {
+  if safe_skip_steps && contains export_grids "${SKIP_STEPS[@]}"; then
+    log "SKIP export_grids (user requested)"
+    return
+  fi
+  # Require assignments & manifest
+  local manifest="${CELLS_OUT_DIR}/manifest.jsonl"
+  [[ -f "$manifest" ]] || die "Manifest missing (expected $manifest). Run extract step first."
+  [[ -f "$ASSIGNMENTS_FILE" ]] || die "Assignments missing (expected $ASSIGNMENTS_FILE). Run assign step first."
+  if [[ -f "$PHASE2_LABEL_MAP" && -d "$PHASE2_GRIDS_DIR" && $FORCE -eq 0 ]]; then
+    log "Phase 2 grids + label_map already exist. Skipping (use --force to regenerate)."
+    return
+  fi
+  log "Exporting Phase 2 primitive ID grids (16x16) + label map + glyph splits..."
+  run_cmd "python -m data.export_phase2_grids \
+    --cells-dir '$CELLS_OUT_DIR' \
+    --assignments '$ASSIGNMENTS_FILE' \
+    --out-dir '$PHASE2_OUT_ROOT' \
+    --chars-csv dataset/chars.csv \
+    --infer-splits \
+    --write-npy \
+    -v"
+  log "Phase 2 grid export complete."
+}
+
+step_phase2_attn() {
+  if safe_skip_steps && contains phase2_attn "${SKIP_STEPS[@]}"; then
+    log "SKIP phase2_attn (user requested)"
+    return
+  fi
+  # Preconditions
+  if [[ ! -f "$PHASE2_CONFIG" ]]; then
+    log "Phase 2 config not found ($PHASE2_CONFIG); skipping attention heatmaps."
+    return
+  fi
+  if [[ ! -d "checkpoints/phase2" ]]; then
+    log "No Phase 2 checkpoint directory (checkpoints/phase2); skipping attention heatmaps."
+    return
+  fi
+  if [[ ! -f "$PHASE2_LABEL_MAP" || ! -d "$PHASE2_GRIDS_DIR" ]]; then
+    log "Phase 2 grids or label_map missing; run export_grids first (skipping phase2_attn)."
+    return
+  fi
+  mkdir -p "$PHASE2_ATTN_OUT"
+  # Pick validation split if present; else sample from available grids.
+  local SPLIT_FILE="$PHASE2_SPLITS_DIR/phase2_val_ids.txt"
+  local SPLIT_ARG=""
+  if [[ -f "$SPLIT_FILE" ]]; then
+    SPLIT_ARG="--split-file $SPLIT_FILE --sample 16"
+  else
+    SPLIT_ARG="--sample 16"
+  fi
+  log "Generating Phase 2 attention heatmaps..."
+  run_cmd "python -m eval.phase2_attention_heatmap \
+    --config '$PHASE2_CONFIG' \
+    --checkpoint-dir checkpoints/phase2 \
+    --grids-dir '$PHASE2_GRIDS_DIR' \
+    --label-map '$PHASE2_LABEL_MAP' \
+    $SPLIT_ARG \
+    --out-dir '$PHASE2_ATTN_OUT' \
+    --per-layer \
+    --global-scale \
+    -v"
+  log "Phase 2 attention heatmap generation complete (see $PHASE2_ATTN_OUT)."
+}
+
 ############################
 # Orchestrate              #
 ############################
@@ -267,6 +341,7 @@ step_overlay() {
     --out-dir $OUT_DIR \
     --panel-out $OUT_DIR/panel.png \
     --sample 20 \
+    --alpha 255 \
     --seed 123"
   log "Overlay visualization complete (see $OUT_DIR)."
 }
@@ -281,15 +356,17 @@ main() {
   log "Force mode: $FORCE | Skip steps: ${_skip_display} | Train enabled: $DO_TRAIN | Only: ${ONLY_STEP:-<none>}"
   if [[ -n "$ONLY_STEP" ]]; then
     case "$ONLY_STEP" in
-      rasterize) step_rasterize ;;
-      extract)   step_extract_cells ;;
-      kmeans)    step_kmeans ;;
-      overlay)   step_overlay ;;
-      assign)    step_assign ;;
-      stats)     step_stats ;;
-      train)     step_train ;;
+      rasterize)     step_rasterize ;;
+      extract)       step_extract_cells ;;
+      kmeans)        step_kmeans ;;
+      overlay)       step_overlay ;;
+      assign)        step_assign ;;
+      stats)         step_stats ;;
+      train)         step_train ;;
+      export_grids)  step_export_grids ;;
+      phase2_attn)   step_phase2_attn ;;
       *)
-        die "Unknown --only step: $ONLY_STEP (valid: rasterize, extract, kmeans, assign, stats, train, overlay)"
+        die "Unknown --only step: $ONLY_STEP (valid: rasterize, extract, kmeans, assign, stats, train, overlay, export_grids, phase2_attn)"
         ;;
     esac
   else
@@ -300,6 +377,8 @@ main() {
     step_stats
     step_train
     step_overlay
+    step_export_grids
+    step_phase2_attn
   fi
   log "=== Pipeline Complete ==="
 }
