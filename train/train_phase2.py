@@ -629,6 +629,14 @@ def train_phase2(cfg: Phase2Config):
     eval_batch_size = int(training_cfg.get("eval_batch_size", batch_size))
     num_workers = int(training_cfg.get("num_workers", 4))
     pin_memory = bool(training_cfg.get("pin_memory", True))
+    # GPU-ready additions:
+    # cache_grids: load all grids into RAM (helps when dataset fits memory; speeds IO-bound CPU/GPU training)
+    # persistent_workers: keep DataLoader workers alive between epochs (efficient for many epochs)
+    cache_grids = bool(training_cfg.get("cache_grids", torch.cuda.is_available()))
+    persistent_workers = (
+        bool(training_cfg.get("persistent_workers", torch.cuda.is_available()))
+        and num_workers > 0
+    )
 
     track_diacritic = "diacritic_subset_accuracy" in (
         cfg.get("metrics", default=[]) or []
@@ -640,6 +648,7 @@ def train_phase2(cfg: Phase2Config):
         label_map,
         glyph_to_label,
         diacritic_flags if track_diacritic else None,
+        cache=cache_grids,
     )
     val_ds = GlyphGridDataset(
         val_ids,
@@ -647,6 +656,7 @@ def train_phase2(cfg: Phase2Config):
         label_map,
         glyph_to_label,
         diacritic_flags if track_diacritic else None,
+        cache=cache_grids,
     )
     test_ds = GlyphGridDataset(
         test_ids,
@@ -654,6 +664,7 @@ def train_phase2(cfg: Phase2Config):
         label_map,
         glyph_to_label,
         diacritic_flags if track_diacritic else None,
+        cache=cache_grids,
     )
 
     # Local collate removed; using top-level collate_grids for multiprocessing safety.
@@ -664,6 +675,7 @@ def train_phase2(cfg: Phase2Config):
         shuffle=True,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
         collate_fn=collate_grids,
     )
     val_loader = DataLoader(
@@ -672,6 +684,7 @@ def train_phase2(cfg: Phase2Config):
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
         collate_fn=collate_grids,
     )
     test_loader = DataLoader(
@@ -680,6 +693,7 @@ def train_phase2(cfg: Phase2Config):
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
         collate_fn=collate_grids,
     )
 

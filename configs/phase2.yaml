@@ -53,7 +53,7 @@ input:
   positional_encoding: sinusoidal_2d # {sinusoidal_2d | learnable_2d}
   combine_mode: add # How positional enc is merged with primitive embeddings
   patch_grouping:
-    enabled: false # If true: group 4x4 → 64 tokens, each projected; disabled baseline
+    enabled: true # GPU: enable 4x4 grouping → reduces tokens (256 → 64) for any transformer use
     patch_rows: 4
     patch_cols: 4
   token_pooling: cls # {cls | mean}; plan allows global average OR CLS
@@ -139,17 +139,17 @@ training:
   #   - set token_id_dropout: 0
   #   - optionally reduce LR again if not yet decayed
   epochs: 40 # Plan: 30–50
-  batch_size: 256 # 128
-  eval_batch_size: 256 # 256
-  num_workers: 2
-  pin_memory: true
+  batch_size: 1024 # GPU: larger batch for higher throughput (adjust if memory constrained)
+  eval_batch_size: 1024 # Match train batch for efficient evaluation
+  num_workers: 8 # Increase data loading parallelism on GPU host
+  pin_memory: true # Keep true for faster H2D transfers
   gradient_accumulation_steps: 1
-  log_interval_steps: 1 # 100
-  token_id_dropout: 0.02 # fraction of primitive IDs randomly zeroed each train step
+  log_interval_steps: 25 # Reduce console overhead with large step counts
+  token_id_dropout: 0.02 # Keep; you can lower to 0 for final fine-tune
   val_interval_epochs: 1
   save_every_epochs: 1
-  mixed_precision: amp # {none | amp}
-  # resume_from: null # path to checkpoint to resume (or set via PHASE2_RESUME env var)
+  mixed_precision: amp # {none | amp} - leverage GPU Tensor Cores
+  cache_grids: true # Preload all grids into RAM (ensure memory headroom)
   resume_from: checkpoints/phase2/best.pt
 
 early_stopping:
