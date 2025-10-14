@@ -334,9 +334,15 @@ def accuracy_topk(
     return res
 
 
-def compute_macro_f1(confusion: torch.Tensor) -> float:
+def compute_macro_f1(
+    confusion: torch.Tensor, training_seen: "Optional[torch.Tensor]" = None
+) -> float:
     """
     confusion: (C,C) tensor where rows = true, cols = pred.
+    training_seen: Optional boolean mask (C,) indicating which classes were seen
+                   in training (frequency > 0). Classes unseen in training are
+                   excluded from the macro F1 denominator even if they appear
+                   in validation.
     """
     tp = torch.diag(confusion)
     fp = confusion.sum(dim=0) - tp
@@ -344,7 +350,15 @@ def compute_macro_f1(confusion: torch.Tensor) -> float:
     precision = tp / torch.clamp(tp + fp, min=1)
     recall = tp / torch.clamp(tp + fn, min=1)
     f1 = 2 * precision * recall / torch.clamp(precision + recall, min=1e-12)
+
+    # Classes with at least one validation instance
     valid = (confusion.sum(dim=1) > 0).float()
+
+    # Exclude classes not seen in training if mask provided
+    if training_seen is not None:
+        training_seen = training_seen.to(valid.device).float()
+        valid = valid * (training_seen > 0)
+
     macro = (f1 * valid).sum().item() / max(1.0, valid.sum().item())
     return macro
 
@@ -1006,10 +1020,15 @@ def train_phase2(cfg: Phase2Config):
             track_subset_diacritic=track_diacritic,
         )
 
-        # Compute macro F1 if confusion matrix available
+        # Compute macro F1 if confusion matrix available (exclude unseen training classes)
         macro_f1 = None
         if "confusion" in val_stats:
-            macro_f1 = compute_macro_f1(val_stats["confusion"].float())
+            training_seen_mask = (
+                (class_counts > 0) if "class_counts" in locals() else None
+            )
+            macro_f1 = compute_macro_f1(
+                val_stats["confusion"].float(), training_seen_mask
+            )
             # ------------------------------------------------------------------
             # Diagnostics: label coverage & per-class accuracy histogram
             # ------------------------------------------------------------------
