@@ -144,6 +144,10 @@ training:
   num_workers: 8 # Increase data loading parallelism on GPU host
   pin_memory: true # Keep true for faster H2D transfers
   gradient_accumulation_steps: 1
+  auto_lr_scale: true # Scale LR by (batch_size / base_batch_size_for_lr) if enabled
+  base_batch_size_for_lr: 256 # Reference batch size for auto LR scaling
+  target_effective_batch_size: 4096 # If > batch_size, gradient accumulation steps are auto-adjusted
+  compile: true # Enable torch.compile (PyTorch 2.x) for graph-level optimization
   log_interval_steps: 25 # Reduce console overhead with large step counts
   token_id_dropout: 0.02 # Keep; you can lower to 0 for final fine-tune
   val_interval_epochs: 1

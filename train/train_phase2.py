@@ -579,6 +579,16 @@ def train_phase2(cfg: Phase2Config):
     seed = int(cfg.get("seed", default=42))
     deterministic = bool(cfg.get("deterministic", default=True))
     set_seed(seed, deterministic=deterministic)
+    # GPU optimization: enable cudnn.benchmark when not forcing determinism (benefits CNN conv performance)
+    if not deterministic and torch.cuda.is_available():
+        try:
+            torch.backends.cudnn.benchmark = True
+            print(
+                "[INFO] cudnn.benchmark enabled (non-deterministic for speed).",
+                flush=True,
+            )
+        except Exception:
+            pass
 
     data_cfg = cfg.get("data", default={}) or {}
     grids_dir = Path(data_cfg.get("grids_dir", "data/processed/grids"))
@@ -637,6 +647,21 @@ def train_phase2(cfg: Phase2Config):
         bool(training_cfg.get("persistent_workers", torch.cuda.is_available()))
         and num_workers > 0
     )
+    # Auto LR scaling: scale learning rate relative to a base batch size if enabled
+    optim_cfg = cfg.get("optim", default={}) or {}
+    if training_cfg.get("auto_lr_scale", True) and "lr" in optim_cfg:
+        base_bs = int(training_cfg.get("base_batch_size_for_lr", 256))
+        if base_bs > 0 and batch_size != base_bs:
+            scale_factor = batch_size / base_bs
+            original_lr = float(optim_cfg.get("lr", 0.0))
+            scaled_lr = original_lr * scale_factor
+            optim_cfg["lr"] = scaled_lr
+            cfg.raw.setdefault("optim", {}).update({"lr": scaled_lr})
+            print(
+                f"[INFO] Auto LR scale: base_bs={base_bs} current_bs={batch_size} "
+                f"original_lr={original_lr:.6g} scaled_lr={scaled_lr:.6g}",
+                flush=True,
+            )
 
     track_diacritic = "diacritic_subset_accuracy" in (
         cfg.get("metrics", default=[]) or []
@@ -723,6 +748,14 @@ def train_phase2(cfg: Phase2Config):
         )
         print("[INFO] Using Phase 2 Transformer architecture", flush=True)
     model.to(device)
+    # Optional torch.compile for graph-level optimization (PyTorch 2.x)
+    compile_flag = bool(training_cfg.get("compile", False))
+    if compile_flag and hasattr(torch, "compile"):
+        try:
+            model = torch.compile(model)
+            print("[INFO] Model compiled with torch.compile()", flush=True)
+        except Exception as e:
+            print(f"[warn] torch.compile failed: {e}", file=sys.stderr)
 
     # Loss / Optim / Scheduler
     loss_cfg = cfg.get("loss", default={}) or {}
@@ -787,7 +820,21 @@ def train_phase2(cfg: Phase2Config):
 
     mixed_precision = training_cfg.get("mixed_precision", "amp") == "amp"
     grad_clip = float(training_cfg.get("grad_clip_norm", 0.0) or 0.0)
+    # Auto gradient accumulation: allow user to specify target effective batch size
     gradient_accum = int(training_cfg.get("gradient_accumulation_steps", 1))
+    target_eff_bs = training_cfg.get("target_effective_batch_size")
+    if target_eff_bs:
+        try:
+            target_eff_bs = int(target_eff_bs)
+            if target_eff_bs > batch_size:
+                gradient_accum = max(1, (target_eff_bs + batch_size - 1) // batch_size)
+                print(
+                    f"[INFO] Adjusted gradient accumulation for target effective batch size: "
+                    f"target={target_eff_bs} per_device={batch_size} steps={gradient_accum}",
+                    flush=True,
+                )
+        except Exception:
+            pass
     # New logging / limiting parameters
     log_interval_steps = int(training_cfg.get("log_interval_steps", 100) or 100)
     limit_train_batches = training_cfg.get("limit_train_batches", None)
