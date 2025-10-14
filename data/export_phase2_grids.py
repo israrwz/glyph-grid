@@ -144,7 +144,7 @@ except ImportError:  # pragma: no cover
 @dataclass
 class Args:
     cells_dir: Path
-    assignments: Path
+    assignments: Optional[Path]
     out_dir: Path
     chars_csv: Optional[Path]
     train_glyph_ids: Optional[Path]
@@ -463,14 +463,21 @@ def export_phase2_grids(args: Args) -> None:
     if not manifest_path.exists():
         raise FileNotFoundError(f"Manifest not found: {manifest_path}")
 
-    if not args.assignments.exists() and args.mode == "assignments":
-        raise FileNotFoundError(f"Assignments file missing: {args.assignments}")
+    if args.mode == "assignments":
+        if not args.assignments:
+            raise FileNotFoundError("Assignments file required for --mode assignments.")
+        if not args.assignments.exists():
+            raise FileNotFoundError(f"Assignments file missing: {args.assignments}")
 
     # ------------------------------------------------------------------
     # Load static assignments (always if hybrid; optional if pure model)
     # ------------------------------------------------------------------
     assignments: Optional[np.ndarray] = None
     if args.mode in ("assignments", "hybrid"):
+        if not args.assignments:
+            raise FileNotFoundError(
+                f"Assignments file required for mode '{args.mode}' but not provided."
+            )
         if args.verbose:
             print("[info] Loading assignments...", file=sys.stderr)
         assignments = load_assignments(args.assignments)
@@ -827,8 +834,8 @@ def parse_args(argv: Optional[List[str]] = None) -> Args:
     p.add_argument(
         "--assignments",
         type=Path,
-        required=True,
-        help="Primitive assignments file (Parquet or JSONL).",
+        default=None,
+        help="Primitive assignments file (Parquet or JSONL). Required for modes 'assignments' and 'hybrid'; optional for 'model'.",
     )
     p.add_argument(
         "--out-dir",

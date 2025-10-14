@@ -319,6 +319,8 @@ step_export_grids() {
 
   log "Exporting Phase 2 primitive ID grids (16x16) in mode=$DESIRED_MODE (ckpt=${PHASE1_CKPT:-none})..."
 
+  # In model mode, do not force an --assignments argument (script now treats it as optional).
+  # MODE_ARG already contains --assignments when required (assignments/hybrid).
   run_cmd "python -m data.export_phase2_grids \
     --cells-dir '$CELLS_OUT_DIR' \
     --out-dir '$PHASE2_OUT_ROOT' \
