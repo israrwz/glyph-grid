@@ -686,6 +686,18 @@ def train_phase2(cfg: Phase2Config):
     mixed_precision = training_cfg.get("mixed_precision", "amp") == "amp"
     grad_clip = float(training_cfg.get("grad_clip_norm", 0.0) or 0.0)
     gradient_accum = int(training_cfg.get("gradient_accumulation_steps", 1))
+    # New logging / limiting parameters
+    log_interval_steps = int(training_cfg.get("log_interval_steps", 100) or 100)
+    limit_train_batches = training_cfg.get("limit_train_batches", None)
+    if isinstance(limit_train_batches, float) and 0 < limit_train_batches <= 1:
+        # Interpret as fraction of total steps
+        # Will resolve after DataLoader is built (need len(train_loader))
+        pass  # placeholder; resolved after train_loader creation
+    elif isinstance(limit_train_batches, int):
+        if limit_train_batches <= 0:
+            limit_train_batches = None
+    else:
+        limit_train_batches = None
 
     # Logging / checkpoints
     ckpt_cfg = cfg.get("checkpoint", default={}) or {}
@@ -790,6 +802,53 @@ def train_phase2(cfg: Phase2Config):
                         running_metrics["subset_correct"] += (
                             (preds[mask] == labels[mask]).sum().item()
                         )
+
+            # Resolve fractional limit after knowing loader length
+            if isinstance(limit_train_batches, float) and 0 < limit_train_batches <= 1:
+                total_steps = len(train_loader)
+                limit_train_batches = int(
+                    max(1, round(limit_train_batches * total_steps))
+                )
+
+            global_step = step + 1
+            if log_interval_steps > 0 and (
+                global_step == 1 or global_step % log_interval_steps == 0
+            ):
+                avg_loss = running_metrics["loss_sum"] / max(
+                    1, running_metrics["samples"]
+                )
+                avg_acc1 = running_metrics["correct1"] / max(
+                    1, running_metrics["samples"]
+                )
+                avg_acc5 = running_metrics["correct5"] / max(
+                    1, running_metrics["samples"]
+                )
+                if track_diacritic and running_metrics["subset_total"] > 0:
+                    avg_dia = (
+                        running_metrics["subset_correct"]
+                        / running_metrics["subset_total"]
+                    )
+                    dia_str = f" dia_acc={avg_dia:.4f}"
+                else:
+                    dia_str = ""
+                print(
+                    f"[EPOCH {epoch:03d}][{global_step}/{len(train_loader)}] "
+                    f"step_loss={(loss.item() * gradient_accum):.4f} avg_loss={avg_loss:.4f} "
+                    f"acc@1={avg_acc1:.4f} acc@5={avg_acc5:.4f}{dia_str} "
+                    f"lr={optimizer.param_groups[0]['lr']:.3e}",
+                    flush=True,
+                )
+
+            if (
+                limit_train_batches
+                and isinstance(limit_train_batches, int)
+                and global_step >= limit_train_batches
+            ):
+                print(
+                    f"[EPOCH {epoch:03d}] Reached limit_train_batches={limit_train_batches}; stopping early.",
+                    flush=True,
+                )
+                break
 
         train_loss = running_metrics["loss_sum"] / max(1, running_metrics["samples"])
         train_acc1 = running_metrics["correct1"] / max(1, running_metrics["samples"])
