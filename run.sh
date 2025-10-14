@@ -2,37 +2,40 @@
 #
 # run.sh
 #
-# End‑to‑end Phase 1 + early Phase 2 artifact pipeline orchestrator for the glyph-grid project.
+# End‑to‑end Phase 1 + Phase 2 artifact pipeline orchestrator for the glyph-grid project.
 #
 # Steps:
-#   1. rasterize      : Rasterize first N glyphs (default: 20,000) using Cairo engine.
-#   2. extract        : Extract 8×8 cells + build font‑based train/val/test splits.
-#   3. kmeans         : K‑Means (sample up to 1M non‑empty cells) → centroids (k=1023 + empty).
-#   4. assign         : Assign every cell to nearest centroid.
-#   5. stats          : Primitive frequency statistics (optional).
-#   6. train          : Train Phase 1 CNN (primitive classifier).
-#   7. overlay        : Overlay visualization on unseen glyphs (Phase 1 centroid coverage QA).
-#   8. export_grids   : (Phase 2 prep) Build per‑glyph 16×16 primitive ID grids + label_map + glyph splits.
-#   9. phase2_attn    : (Phase 2 interpretability) Generate transformer attention heatmaps (requires Phase 2 checkpoint; skipped if absent).
+#   1. rasterize       : Rasterize first N glyphs (default: 20,000) using Cairo engine.
+#   2. extract         : Extract 8×8 cells + build font‑based train/val/test splits.
+#   3. kmeans          : K‑Means (sample up to 1M non‑empty cells) → centroids (k=1023 + empty).
+#   4. assign          : Assign every cell to nearest centroid.
+#   5. stats           : Primitive frequency statistics (optional).
+#   6. train           : Train Phase 1 CNN (primitive classifier).
+#   7. overlay         : Overlay visualization on unseen glyphs (Phase 1 centroid coverage QA).
+#   8. export_grids    : (Phase 2 prep) Build per‑glyph 16×16 primitive ID grids + label_map + glyph splits.
+#   9. train_phase2    : Train Phase 2 transformer on primitive ID grids.
+#  10. phase2_attn     : (Phase 2 interpretability) Generate transformer attention heatmaps (requires Phase 2 checkpoint; skipped if absent).
 #
 # Each step is idempotent where possible (skips if expected outputs already exist)
 # unless --force is provided.
 #
 # Usage:
-#   ./run.sh                            # run full pipeline with defaults (Phase 1 + export_grids + phase2_attn if possible)
-#   ./run.sh --limit 5000               # only rasterize first 5k glyphs
-#   ./run.sh --no-train                 # stop after assignments (still can export_grids if requested explicitly)
-#   ./run.sh --force                    # re-run all steps (overwrite)
-#   ./run.sh --skip <step>              # skip a named step (repeatable)
-#                                       # steps: rasterize, extract, kmeans, assign, stats, train, overlay, export_grids, phase2_attn
-#   ./run.sh --only <step>              # run only the named step (ignores others & --no-train)
-#                                       # valid: rasterize, extract, kmeans, assign, stats, train, overlay, export_grids, phase2_attn
+#   ./run.sh                               # full pipeline (Phase 1 + Phase 2 if grids & config present)
+#   ./run.sh --limit 5000                  # only rasterize first 5k glyphs
+#   ./run.sh --no-train                    # skip Phase 1 training (Phase 2 train still runs if invoked explicitly)
+#   ./run.sh --force                       # re-run all steps (overwrite)
+#   ./run.sh --skip <step>                 # skip a named step (repeatable)
+#                                          # steps: rasterize, extract, kmeans, assign, stats, train, overlay, export_grids, train_phase2, phase2_attn
+#   ./run.sh --only <step>                 # run only the named step (ignores others & --no-train)
+#                                          # valid: rasterize, extract, kmeans, assign, stats, train, overlay, export_grids, train_phase2, phase2_attn
 #
-#   ./run.sh --dry-run                  # print the commands without executing
+#   ./run.sh --dry-run                     # print the commands without executing
 #
 # Environment overrides (optional):
 #   GLYPH_LIMIT=25000 ./run.sh
 #   KMEANS_SAMPLE=750000 ./run.sh
+#   GRID_MODE=model ./run.sh --only export_grids
+#   PHASE2_SKIP_ATTENTION=1 ./run.sh       # example to skip phase2_attn via skip or env (optional user pattern)
 #
 DRY_RUN=0
  set -euo pipefail
@@ -52,7 +55,7 @@ TEST_RATIO="${TEST_RATIO:-0.1}"
 # Paths (relative to repo root)
 RASTER_CONFIG="configs/rasterizer.yaml"
 PHASE1_CONFIG="configs/phase1.yaml"
-PHASE2_CONFIG="configs/phase2.yaml"  # Needed for attention heatmap (model architecture)
+PHASE2_CONFIG="configs/phase2.yaml"  # Needed for Phase 2 training & attention heatmap
 
 RASTERS_DIR="data/rasters"
 METADATA_FILE="${RASTERS_DIR}/metadata.jsonl"
@@ -66,6 +69,8 @@ PHASE2_GRIDS_DIR="${PHASE2_OUT_ROOT}/grids"
 PHASE2_LABEL_MAP="${PHASE2_OUT_ROOT}/label_map.json"
 PHASE2_SPLITS_DIR="${PHASE2_OUT_ROOT}/splits"
 PHASE2_ATTN_OUT="output/phase2_attn"
+PHASE2_TRAIN_LOG_DIR="logs/phase2"
+PHASE2_CKPT_DIR="checkpoints/phase2"
 
 # Skip & force flags
 FORCE=0
@@ -248,6 +253,25 @@ step_train() {
   log "Phase 1 training finished."
 }
 
+step_train_phase2() {
+  if safe_skip_steps && contains train_phase2 "${SKIP_STEPS[@]}"; then
+    log "SKIP train_phase2 (user requested)"
+    return
+  fi
+  if [[ ! -f "$PHASE2_CONFIG" ]]; then
+    log "Phase 2 config missing ($PHASE2_CONFIG); skipping train_phase2."
+    return
+  fi
+  # Require grids + label map
+  if [[ ! -d "$PHASE2_GRIDS_DIR" || ! -f "$PHASE2_LABEL_MAP" ]]; then
+    log "Phase 2 grids/label_map missing (expected $PHASE2_GRIDS_DIR and $PHASE2_LABEL_MAP). Run export_grids first."
+    return
+  fi
+  mkdir -p "$PHASE2_TRAIN_LOG_DIR" "$PHASE2_CKPT_DIR"
+  log "Starting Phase 2 transformer training..."
+  run_cmd "python -m train.train_phase2 --config '$PHASE2_CONFIG'"
+  log "Phase 2 training finished."
+}
 step_export_grids() {
   if safe_skip_steps && contains export_grids "${SKIP_STEPS[@]}"; then
     log "SKIP export_grids (user requested)"
@@ -426,6 +450,7 @@ main() {
       train)         step_train ;;
       export_grids)  step_export_grids ;;
       phase2_attn)   step_phase2_attn ;;
+      train_phase2)  step_train_phase2 ;;
       *)
         die "Unknown --only step: $ONLY_STEP (valid: rasterize, extract, kmeans, assign, stats, train, overlay, export_grids, phase2_attn)"
         ;;
@@ -439,6 +464,7 @@ main() {
     step_train
     step_overlay
     step_export_grids
+    step_train_phase2
     step_phase2_attn
   fi
   log "=== Pipeline Complete ==="
