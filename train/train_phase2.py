@@ -825,7 +825,8 @@ def train_phase2(cfg: Phase2Config):
                     "loss",
                     "accuracy_top1",
                     "accuracy_top5",
-                    "macro_f1",
+                    "macro_f1_seen",
+                    "macro_f1_all",
                     "diacritic_subset_accuracy",
                     "lr",
                     "time_sec",
@@ -1020,15 +1021,16 @@ def train_phase2(cfg: Phase2Config):
             track_subset_diacritic=track_diacritic,
         )
 
-        # Compute macro F1 if confusion matrix available (exclude unseen training classes)
-        macro_f1 = None
+        # Compute macro F1 variants if confusion matrix available
+        macro_f1_seen = None
+        macro_f1_all = None
         if "confusion" in val_stats:
+            conf_float = val_stats["confusion"].float()
             training_seen_mask = (
                 (class_counts > 0) if "class_counts" in locals() else None
             )
-            macro_f1 = compute_macro_f1(
-                val_stats["confusion"].float(), training_seen_mask
-            )
+            macro_f1_all = compute_macro_f1(conf_float, None)
+            macro_f1_seen = compute_macro_f1(conf_float, training_seen_mask)
             # ------------------------------------------------------------------
             # Diagnostics: label coverage & per-class accuracy histogram
             # ------------------------------------------------------------------
@@ -1156,7 +1158,8 @@ def train_phase2(cfg: Phase2Config):
                     f"{train_loss:.6f}",
                     f"{train_acc1:.6f}",
                     f"{train_acc5:.6f}",
-                    f"{(macro_f1 or 0):.6f}",
+                    "",  # macro_f1_seen not computed for train
+                    "",  # macro_f1_all not computed for train
                     f"{(train_subset_acc or 0):.6f}",
                     f"{current_lr:.6e}",
                     f"{epoch_time:.2f}",
@@ -1169,7 +1172,8 @@ def train_phase2(cfg: Phase2Config):
                     f"{val_stats['loss']:.6f}",
                     f"{val_stats['accuracy_top1']:.6f}",
                     f"{val_stats['accuracy_top5']:.6f}",
-                    f"{(macro_f1 or 0):.6f}",
+                    f"{(macro_f1_seen or 0):.6f}",
+                    f"{(macro_f1_all or 0):.6f}",
                     f"{val_stats.get('diacritic_subset_accuracy', 0.0):.6f}",
                     f"{current_lr:.6e}",
                     f"{epoch_time:.2f}",
@@ -1182,8 +1186,10 @@ def train_phase2(cfg: Phase2Config):
             tb_writer.add_scalar("val/loss", val_stats["loss"], epoch)
             tb_writer.add_scalar("val/accuracy_top1", val_stats["accuracy_top1"], epoch)
             tb_writer.add_scalar("val/accuracy_top5", val_stats["accuracy_top5"], epoch)
-            if macro_f1 is not None:
-                tb_writer.add_scalar("val/macro_f1", macro_f1, epoch)
+            if macro_f1_seen is not None:
+                tb_writer.add_scalar("val/macro_f1_seen", macro_f1_seen, epoch)
+            if macro_f1_all is not None:
+                tb_writer.add_scalar("val/macro_f1_all", macro_f1_all, epoch)
             if track_diacritic and "diacritic_subset_accuracy" in val_stats:
                 tb_writer.add_scalar(
                     "val/diacritic_subset_accuracy",
@@ -1195,7 +1201,7 @@ def train_phase2(cfg: Phase2Config):
             f"[EPOCH {epoch:03d}] "
             f"Train: loss={train_loss:.4f} acc@1={train_acc1:.4f} "
             f"| Val: loss={val_stats['loss']:.4f} acc@1={val_stats['accuracy_top1']:.4f} acc@5={val_stats['accuracy_top5']:.4f} "
-            f"macroF1={(macro_f1 or 0):.4f} "
+            f"macroF1_seen={(macro_f1_seen or 0):.4f} macroF1_all={(macro_f1_all or 0):.4f} "
             f"{'(dia=' + format(val_stats.get('diacritic_subset_accuracy', 0.0), '.4f') + ')' if track_diacritic else ''} "
             f"| lr={current_lr:.3e} time={epoch_time:.1f}s",
             flush=True,
@@ -1301,7 +1307,7 @@ def train_phase2(cfg: Phase2Config):
         macro_f1_test = compute_macro_f1(test_stats["confusion"].float())
     print(
         f"[TEST] loss={test_stats['loss']:.4f} acc@1={test_stats['accuracy_top1']:.4f} "
-        f"acc@5={test_stats['accuracy_top5']:.4f} macroF1={(macro_f1_test or 0):.4f} "
+        f"acc@5={test_stats['accuracy_top5']:.4f} macroF1_seen={(macro_f1_test or 0):.4f} "
         f"{'(dia=' + format(test_stats.get('diacritic_subset_accuracy', 0.0), '.4f') + ')' if track_diacritic else ''}",
         flush=True,
     )
