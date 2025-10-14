@@ -26,8 +26,20 @@ Two Modes of Grid Construction
        --assignments          (Parquet or JSONL: cell_id, primitive_id)
    - Simply scatters primitive_id values into a 16x16 array for each glyph.
 
-2. From Model Inference (future extension; NOT implemented here):
-   - Would load Phase 1 checkpoint and rerun CNN; placeholder left for extension.
+2. From Model / Hybrid Inference (implemented):
+   - Loads a Phase 1 CNN checkpoint and runs inference over all cell shards to obtain
+     predicted primitive IDs (and max softmax probability per cell).
+   - Modes (select with --mode):
+       * assignments  : (default) use static K-Means nearest‑centroid assignments (original behavior).
+       * model        : ignore static assignments and use model predictions for every non-empty cell.
+       * hybrid       : start from assignments; override a cell’s primitive ID with the model’s
+                        prediction ONLY IF:
+                           (a) prediction != assignment
+                           (b) model confidence >= --hybrid-conf-threshold
+                           (c) (optional) centroid distance improvement >= --hybrid-min-improve
+     (c) requires a centroid file (either passed explicitly or inferred); if absent, (c) is skipped.
+   - All three modes write the same per‑glyph 16×16 grids; provenance is logged in
+     grids_manifest.json for reproducibility.
 
 Label Mapping
 -------------
@@ -143,6 +155,13 @@ class Args:
     fail_on_missing: bool
     verbose: bool
     top_k_primitive_stats: int
+    # New Phase 1 model inference / hybrid fields
+    mode: str  # assignments | model | hybrid
+    phase1_checkpoint: Optional[Path]
+    centroid_file: Optional[Path]
+    inference_batch_size: int
+    hybrid_conf_threshold: float
+    hybrid_min_improve: float
 
 
 # ---------------------------------------------------------------------------
@@ -444,20 +463,258 @@ def export_phase2_grids(args: Args) -> None:
     if not manifest_path.exists():
         raise FileNotFoundError(f"Manifest not found: {manifest_path}")
 
-    if not args.assignments.exists():
+    if not args.assignments.exists() and args.mode == "assignments":
         raise FileNotFoundError(f"Assignments file missing: {args.assignments}")
 
-    if args.verbose:
-        print("[info] Loading assignments...", file=sys.stderr)
-    assignments = load_assignments(args.assignments)
-    if args.verbose:
-        print(f"[info] Assignments loaded: length={len(assignments)}", file=sys.stderr)
+    # ------------------------------------------------------------------
+    # Load static assignments (always if hybrid; optional if pure model)
+    # ------------------------------------------------------------------
+    assignments: Optional[np.ndarray] = None
+    if args.mode in ("assignments", "hybrid"):
+        if args.verbose:
+            print("[info] Loading assignments...", file=sys.stderr)
+        assignments = load_assignments(args.assignments)
+        if args.verbose:
+            print(
+                f"[info] Assignments loaded: length={len(assignments)}",
+                file=sys.stderr,
+            )
+
+    # ------------------------------------------------------------------
+    # Optional Phase 1 model inference
+    # ------------------------------------------------------------------
+    model_preds: Optional[np.ndarray] = None  # int32 predicted primitive id per cell
+    model_conf: Optional[np.ndarray] = None  # float32 max softmax prob per cell
+    assigned_centroid_dists: Optional[np.ndarray] = None
+    predicted_centroid_dists: Optional[np.ndarray] = None
+
+    if args.mode in ("model", "hybrid"):
+        try:
+            import torch
+            from torch.utils.data import DataLoader
+            from models.phase1_cnn import build_phase1_model
+        except Exception as e:
+            raise RuntimeError(
+                f"Phase 1 model inference requested (--mode {args.mode}) but torch/model import failed: {e}"
+            ) from e
+        if not args.phase1_checkpoint or not args.phase1_checkpoint.exists():
+            raise FileNotFoundError(
+                f"Phase 1 checkpoint required for mode '{args.mode}': {args.phase1_checkpoint}"
+            )
+        if args.verbose:
+            print(
+                f"[info] Loading Phase 1 checkpoint: {args.phase1_checkpoint}",
+                file=sys.stderr,
+            )
+        # Build baseline model (config mirrors phase1)
+        phase1 = build_phase1_model(
+            {
+                "in_channels": 1,
+                "conv_blocks": [
+                    {
+                        "out_channels": 32,
+                        "kernel": 3,
+                        "stride": 1,
+                        "padding": 1,
+                        "batchnorm": True,
+                        "pool": 2,
+                    },
+                    {
+                        "out_channels": 64,
+                        "kernel": 3,
+                        "stride": 1,
+                        "padding": 1,
+                        "batchnorm": True,
+                        "pool": 2,
+                    },
+                ],
+                "flatten_dim": 256,
+                "fc_hidden": 128,
+                "fc_dropout": 0.2,
+                "num_classes": 1024,
+                "weight_init": "none",
+            }
+        )
+        ckpt_raw = torch.load(args.phase1_checkpoint, map_location="cpu")
+        if isinstance(ckpt_raw, dict):
+            state_dict = (
+                ckpt_raw.get("model_state")
+                or ckpt_raw.get("model_state_dict")
+                or ckpt_raw
+            )
+        else:
+            state_dict = ckpt_raw
+        phase1.load_state_dict(state_dict, strict=True)
+        phase1.eval()
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        phase1.to(device)
+
+        # Centroids (optional for distance improvement)
+        centroids = None
+        if args.centroid_file and args.centroid_file.exists():
+            centroids = np.load(args.centroid_file)
+            if centroids.shape[1] != 64:
+                if args.verbose:
+                    print(
+                        f"[warn] Centroid dimensionality unexpected: {centroids.shape}",
+                        file=sys.stderr,
+                    )
+                centroids = None
+
+        # Iterate shards
+        shard_paths = sorted(args.cells_dir.glob("shard_*.npy"))
+        if not shard_paths:
+            raise RuntimeError("No cell shard_*.npy files found for inference.")
+        # Determine total cells for allocation
+        total_cells = 0
+        shard_lengths = []
+        for sp in shard_paths:
+            arr = np.load(sp, mmap_mode="r")
+            length = len(arr)
+            shard_lengths.append((sp, length))
+            total_cells += length
+
+        model_preds = np.full(total_cells, -1, dtype=np.int32)
+        model_conf = np.zeros(total_cells, dtype=np.float32)
+        if centroids is not None and args.mode == "hybrid":
+            assigned_centroid_dists = np.full(total_cells, np.nan, dtype=np.float32)
+            predicted_centroid_dists = np.full(total_cells, np.nan, dtype=np.float32)
+
+        running_base = 0
+        batch_size = args.inference_batch_size
+        with torch.no_grad():
+            for sp, length in shard_lengths:
+                shard = np.load(sp, mmap_mode="r")
+                # Normalize to (N,1,8,8) float32 0/1
+                if shard.ndim == 4 and shard.shape[1] == 1:
+                    cells_np = shard
+                else:
+                    cells_np = shard[:, None, ...] if shard.ndim == 3 else shard
+                # Binarize
+                cells_np = (cells_np > 0).astype("float32")
+                N = cells_np.shape[0]
+                for start in range(0, N, batch_size):
+                    end = min(start + batch_size, N)
+                    batch = torch.from_numpy(cells_np[start:end]).to(device)
+                    logits = phase1(batch)
+                    probs = torch.softmax(logits, dim=1)
+                    conf, pred = probs.max(dim=1)
+                    model_preds[running_base + start : running_base + end] = (
+                        pred.cpu().numpy().astype(np.int32)
+                    )
+                    model_conf[running_base + start : running_base + end] = (
+                        conf.cpu().numpy().astype(np.float32)
+                    )
+                    if centroids is not None and args.mode == "hybrid":
+                        # Distance for assigned & predicted centroids
+                        cell_bin = batch.cpu().numpy().reshape(end - start, 64)
+                        if assignments is not None:
+                            assigned_ids = assignments[
+                                running_base + start : running_base + end
+                            ]
+                        else:
+                            assigned_ids = np.zeros(end - start, dtype=np.int32)
+                        pred_ids = pred.cpu().numpy()
+                        # Pre-reshape centroids
+                        for i in range(end - start):
+                            c_vec_pred = (
+                                centroids[pred_ids[i]]
+                                if pred_ids[i] < len(centroids)
+                                else None
+                            )
+                            c_vec_assn = (
+                                centroids[assigned_ids[i]]
+                                if assigned_ids[i] < len(centroids)
+                                else None
+                            )
+                            if c_vec_pred is not None:
+                                predicted_centroid_dists[running_base + start + i] = (
+                                    float(
+                                        np.linalg.norm(
+                                            cell_bin[i] - c_vec_pred.reshape(-1)
+                                        )
+                                    )
+                                )
+                            if c_vec_assn is not None:
+                                assigned_centroid_dists[running_base + start + i] = (
+                                    float(
+                                        np.linalg.norm(
+                                            cell_bin[i] - c_vec_assn.reshape(-1)
+                                        )
+                                    )
+                                )
+                running_base += length
+        if args.verbose:
+            agree = None
+            if assignments is not None:
+                agree = (model_preds == assignments).mean()
+            print(
+                f"[info] Phase 1 inference complete. cells={total_cells} "
+                f"avg_conf={model_conf.mean():.4f} agree_with_assignments={agree}",
+                file=sys.stderr,
+            )
+
+    # ------------------------------------------------------------------
+    # Build glyph grids using chosen mode
+    # ------------------------------------------------------------------
+    if args.mode == "assignments":
+        glyph_source = assignments
+    elif args.mode == "model":
+        glyph_source = model_preds
+    else:  # hybrid
+        if assignments is None or model_preds is None:
+            raise RuntimeError(
+                "Hybrid mode requires both assignments and model predictions."
+            )
+        glyph_source = assignments.copy()
+        overrides = 0
+        for cid in range(len(glyph_source)):
+            pred_id = model_preds[cid]
+            assn_id = assignments[cid]
+            if pred_id == assn_id:
+                continue
+            if model_conf[cid] < args.hybrid_conf_threshold:
+                continue
+            if (
+                assigned_centroid_dists is not None
+                and predicted_centroid_dists is not None
+                and not np.isnan(assigned_centroid_dists[cid])
+                and not np.isnan(predicted_centroid_dists[cid])
+            ):
+                improvement = (
+                    assigned_centroid_dists[cid] - predicted_centroid_dists[cid]
+                )
+                if improvement < args.hybrid_min_improve:
+                    continue
+            glyph_source[cid] = pred_id
+            overrides += 1
+        if args.verbose:
+            print(
+                f"[info] Hybrid overrides applied: {overrides} "
+                f"({overrides / len(glyph_source):.4%} of cells)",
+                file=sys.stderr,
+            )
 
     glyph_grids = build_glyph_grids(
         manifest_path,
-        assignments,
+        glyph_source,
         verbose=args.verbose,
     )
+
+    # Provenance manifest
+    provenance = {
+        "mode": args.mode,
+        "phase1_checkpoint": str(args.phase1_checkpoint)
+        if args.phase1_checkpoint
+        else None,
+        "centroid_file": str(args.centroid_file) if args.centroid_file else None,
+        "hybrid_conf_threshold": args.hybrid_conf_threshold,
+        "hybrid_min_improve": args.hybrid_min_improve,
+        "inference_batch_size": args.inference_batch_size,
+        "source_assignments": str(args.assignments)
+        if assignments is not None
+        else None,
+    }
 
     # Write grids
     grids_dir = args.out_dir / "grids"
@@ -542,6 +799,14 @@ def export_phase2_grids(args: Args) -> None:
         json.dump(stats, f, indent=2)
     if args.verbose:
         print(f"[info] Wrote stats → {stats_path}", file=sys.stderr)
+    # Write provenance manifest
+    with open(args.out_dir / "grids_manifest.json", "w", encoding="utf-8") as f:
+        json.dump(provenance, f, indent=2)
+    if args.verbose:
+        print(
+            f"[info] Wrote grids provenance → {args.out_dir / 'grids_manifest.json'}",
+            file=sys.stderr,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -551,7 +816,7 @@ def export_phase2_grids(args: Args) -> None:
 
 def parse_args(argv: Optional[List[str]] = None) -> Args:
     p = argparse.ArgumentParser(
-        description="Export Phase 2 primitive ID grids (16x16) from Phase 1 assignments."
+        description="Export Phase 2 primitive ID grids (16x16) from Phase 1 assignments / model / hybrid inference."
     )
     p.add_argument(
         "--cells-dir",
@@ -617,6 +882,44 @@ def parse_args(argv: Optional[List[str]] = None) -> Args:
         help="Number of top primitives to record in stats JSON.",
     )
     p.add_argument("-v", "--verbose", action="store_true", help="Verbose logging.")
+    # New inference / hybrid arguments
+    p.add_argument(
+        "--mode",
+        type=str,
+        default="assignments",
+        choices=["assignments", "model", "hybrid"],
+        help="Primitive ID source: static assignments | model inference | hybrid override.",
+    )
+    p.add_argument(
+        "--phase1-checkpoint",
+        type=Path,
+        default=None,
+        help="Phase 1 model checkpoint (.pt) required for modes 'model' and 'hybrid'.",
+    )
+    p.add_argument(
+        "--centroid-file",
+        type=Path,
+        default=Path("assets/centroids/primitive_centroids.npy"),
+        help="Centroids file for distance improvement (hybrid).",
+    )
+    p.add_argument(
+        "--inference-batch-size",
+        type=int,
+        default=8192,
+        help="Batch size for Phase 1 model inference over cells.",
+    )
+    p.add_argument(
+        "--hybrid-conf-threshold",
+        type=float,
+        default=0.9,
+        help="Minimum model confidence to override an assignment in hybrid mode.",
+    )
+    p.add_argument(
+        "--hybrid-min-improve",
+        type=float,
+        default=0.0,
+        help="Minimum (assigned_dist - predicted_dist) improvement required to override (if distances available).",
+    )
     args = p.parse_args(argv)
 
     return Args(
@@ -632,6 +935,12 @@ def parse_args(argv: Optional[List[str]] = None) -> Args:
         fail_on_missing=args.fail_on_missing,
         verbose=args.verbose,
         top_k_primitive_stats=args.top_k_primitive_stats,
+        mode=args.mode,
+        phase1_checkpoint=args.phase1_checkpoint,
+        centroid_file=args.centroid_file,
+        inference_batch_size=args.inference_batch_size,
+        hybrid_conf_threshold=args.hybrid_conf_threshold,
+        hybrid_min_improve=args.hybrid_min_improve,
     )
 
 

@@ -253,24 +253,83 @@ step_export_grids() {
     log "SKIP export_grids (user requested)"
     return
   fi
-  # Require assignments & manifest
+  # Require assignments & manifest (assignments still needed for hybrid reference even if using model mode)
   local manifest="${CELLS_OUT_DIR}/manifest.jsonl"
   [[ -f "$manifest" ]] || die "Manifest missing (expected $manifest). Run extract step first."
-  [[ -f "$ASSIGNMENTS_FILE" ]] || die "Assignments missing (expected $ASSIGNMENTS_FILE). Run assign step first."
+  if [[ ! -f "$ASSIGNMENTS_FILE" ]]; then
+    if [[ "${GRID_MODE:-assignments}" == "assignments" ]]; then
+      die "Assignments missing (expected $ASSIGNMENTS_FILE). Run assign step first."
+    else
+      log "WARN: assignments file missing but GRID_MODE=$GRID_MODE requested; hybrid mode will be downgraded to model."
+    fi
+  fi
+
   if [[ -f "$PHASE2_LABEL_MAP" && -d "$PHASE2_GRIDS_DIR" && $FORCE -eq 0 ]]; then
     log "Phase 2 grids + label_map already exist. Skipping (use --force to regenerate)."
     return
   fi
-  log "Exporting Phase 2 primitive ID grids (16x16) + label map + glyph splits..."
+
+  # Decide mode: environment variable GRID_MODE can force {assignments|model|hybrid}
+  # Default heuristic: if a Phase 1 checkpoint exists use model mode, else assignments.
+  local MODE_ARG=""
+  local CKPT_ARG=""
+  local CENTROID_ARG="--centroid-file '$CENTROIDS_OUT'"
+  local PHASE1_CKPT=""
+
+  if ls checkpoints/phase1/*.pt >/dev/null 2>&1; then
+    PHASE1_CKPT="$(ls -t checkpoints/phase1/*.pt | head -n1)"
+  fi
+
+  local DESIRED_MODE="${GRID_MODE:-}"
+  if [[ -z "$DESIRED_MODE" ]]; then
+    if [[ -n "$PHASE1_CKPT" ]]; then
+      DESIRED_MODE="model"
+    else
+      DESIRED_MODE="assignments"
+    fi
+  fi
+
+  if [[ "$DESIRED_MODE" == "model" || "$DESIRED_MODE" == "hybrid" ]]; then
+    if [[ -z "$PHASE1_CKPT" ]]; then
+      log "WARN: No Phase 1 checkpoint found; falling back to assignments mode."
+      DESIRED_MODE="assignments"
+    fi
+  fi
+
+  case "$DESIRED_MODE" in
+    assignments)
+      MODE_ARG="--mode assignments --assignments '$ASSIGNMENTS_FILE'"
+      ;;
+    model)
+      MODE_ARG="--mode model --phase1-checkpoint '$PHASE1_CKPT'"
+      # assignments file not strictly required here
+      ;;
+    hybrid)
+      if [[ ! -f "$ASSIGNMENTS_FILE" ]]; then
+        log "WARN: Hybrid requested but assignments missing; using model mode."
+        MODE_ARG="--mode model --phase1-checkpoint '$PHASE1_CKPT'"
+      else
+        MODE_ARG="--mode hybrid --phase1-checkpoint '$PHASE1_CKPT' --assignments '$ASSIGNMENTS_FILE'"
+      fi
+      ;;
+    *)
+      die "Invalid GRID_MODE '$DESIRED_MODE' (expected assignments|model|hybrid)"
+      ;;
+  esac
+
+  log "Exporting Phase 2 primitive ID grids (16x16) in mode=$DESIRED_MODE (ckpt=${PHASE1_CKPT:-none})..."
+
   run_cmd "python -m data.export_phase2_grids \
     --cells-dir '$CELLS_OUT_DIR' \
-    --assignments '$ASSIGNMENTS_FILE' \
     --out-dir '$PHASE2_OUT_ROOT' \
     --chars-csv dataset/chars.csv \
     --infer-splits \
     --write-npy \
+    $MODE_ARG \
+    $CENTROID_ARG \
     -v"
-  log "Phase 2 grid export complete."
+
+  log "Phase 2 grid export complete (mode=$DESIRED_MODE)."
 }
 
 step_phase2_attn() {
