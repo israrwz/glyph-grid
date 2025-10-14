@@ -889,16 +889,20 @@ def train_phase2(cfg: Phase2Config):
         import re
 
         epoch_ckpts = []
+        pattern = re.compile(r"epoch(\d+)-val([0-9.]+)\.pt$")
         for p in ckpt_dir.glob("epoch*-val*.pt"):
-            m = re.match(r"epoch(\\d+)-val", p.name)
+            m = pattern.match(p.name)
             if m:
                 try:
-                    epoch_ckpts.append((int(m.group(1)), p))
+                    epoch_i = int(m.group(1))
+                    val_acc = float(m.group(2))
+                    epoch_ckpts.append((val_acc, epoch_i, p))
                 except ValueError:
                     pass
         if epoch_ckpts:
-            epoch_ckpts.sort(key=lambda x: x[0], reverse=True)
-            _, best_candidate = epoch_ckpts[0]
+            # Sort by highest val accuracy, tie-break by latest epoch
+            epoch_ckpts.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            _, _, best_candidate = epoch_ckpts[0]
             try:
                 if best_link.exists() or best_link.is_symlink():
                     best_link.unlink()
