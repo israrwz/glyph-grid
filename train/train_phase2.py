@@ -1040,35 +1040,76 @@ def train_phase2(cfg: Phase2Config):
                     f"acc_hist={bin_counts}",
                     flush=True,
                 )
-                # Head / Tail diagnostics (frequency deciles)
+                # Head / Tail diagnostics (frequency deciles) - improved to exclude unseen classes
                 try:
-                    # Determine decile size
-                    decile = max(1, num_labels // 10)
-                    # Sort by training frequency
-                    freq_sorted, idx_sorted = torch.sort(class_counts)
-                    tail_idx = idx_sorted[:decile]
-                    head_idx = idx_sorted[-decile:]
-                    # Accuracy per class already in acc_per_class
-                    head_acc = acc_per_class[head_idx]
-                    tail_acc = acc_per_class[tail_idx]
-                    # Filter only seen classes for tail to avoid div-by-zero bias
-                    head_mean = (
-                        head_acc[head_acc > 0].mean().item()
-                        if (head_acc > 0).any()
-                        else 0.0
+                    # Classes actually seen in training (frequency > 0)
+                    seen_mask_counts = class_counts > 0
+                    unseen_count = (~seen_mask_counts).sum().item()
+                    seen_indices = torch.nonzero(seen_mask_counts, as_tuple=False).view(
+                        -1
                     )
-                    tail_mean = (
-                        tail_acc[tail_acc > 0].mean().item()
-                        if (tail_acc > 0).any()
-                        else 0.0
-                    )
-                    head_freq_mean = class_counts[head_idx].mean().item()
-                    tail_freq_mean = class_counts[tail_idx].mean().item()
+                    if seen_indices.numel() > 0:
+                        seen_counts = class_counts[seen_indices]
+                        # Sort only seen classes by frequency
+                        seen_counts_sorted, seen_idx_sorted_local = torch.sort(
+                            seen_counts
+                        )
+                        seen_sorted_global_idx = seen_indices[seen_idx_sorted_local]
+                        decile = max(1, seen_sorted_global_idx.numel() // 10)
+                        tail_seen = seen_sorted_global_idx[:decile]
+                        head_seen = seen_sorted_global_idx[-decile:]
+                        # Accuracy values
+                        head_acc_vals = acc_per_class[head_seen]
+                        tail_acc_vals = acc_per_class[tail_seen]
+                        head_acc_mean = (
+                            head_acc_vals.mean().item()
+                            if head_acc_vals.numel()
+                            else 0.0
+                        )
+                        tail_acc_mean = (
+                            tail_acc_vals.mean().item()
+                            if tail_acc_vals.numel()
+                            else 0.0
+                        )
+                        tail_acc_nonzero = (
+                            tail_acc_vals[tail_acc_vals > 0].mean().item()
+                            if (tail_acc_vals > 0).any()
+                            else 0.0
+                        )
+                        head_freq_mean = (
+                            class_counts[head_seen].mean().item()
+                            if head_seen.numel()
+                            else 0.0
+                        )
+                        tail_freq_mean = (
+                            class_counts[tail_seen].mean().item()
+                            if tail_seen.numel()
+                            else 0.0
+                        )
+                    else:
+                        head_acc_mean = tail_acc_mean = tail_acc_nonzero = 0.0
+                        head_freq_mean = tail_freq_mean = 0.0
+                        decile = 0
+                        unseen_count = int(class_counts.numel())
                     print(
-                        f"[VAL][diag2] head_acc={head_mean:.3f} tail_acc={tail_mean:.3f} "
+                        f"[VAL][diag2] head_acc={head_acc_mean:.3f} tail_acc={tail_acc_mean:.3f} "
+                        f"tail_acc_nonzero={tail_acc_nonzero:.3f} unseen_classes={unseen_count} "
                         f"head_freq_mean={head_freq_mean:.1f} tail_freq_mean={tail_freq_mean:.1f}",
                         flush=True,
                     )
+                    # Frequency distribution logging every 2 epochs
+                    if epoch % 2 == 0:
+                        freq_bins = [0, 1, 2, 5, 10, 20, 50, 100, 1_000_000]
+                        counts_per_bin = [0] * (len(freq_bins) - 1)
+                        for c in class_counts.tolist():
+                            for b in range(len(freq_bins) - 1):
+                                if freq_bins[b] <= c < freq_bins[b + 1]:
+                                    counts_per_bin[b] += 1
+                                    break
+                        print(
+                            f"[VAL][freq] train_class_freq_bins={counts_per_bin} bins={freq_bins}",
+                            flush=True,
+                        )
                 except Exception as e_head_tail:
                     print(
                         f"[warn] head/tail diagnostics failed: {e_head_tail}",
