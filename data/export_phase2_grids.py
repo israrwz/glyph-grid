@@ -257,22 +257,32 @@ def build_glyph_grids(
 def load_label_rows(chars_csv: Path) -> List[Dict]:
     """
     Reads chars.csv expecting a 'label' column.
+    Uses csv.DictReader to handle embedded commas (e.g., in joining_group values).
     Returns list of row dicts.
+
+    Skips rows where 'label' is missing or empty. Logs (stderr) the number
+    of skipped rows for transparency.
     """
+    import csv
+
     rows: List[Dict] = []
-    with open(chars_csv, "r", encoding="utf-8") as f:
-        header = f.readline().strip().split(",")
-        if "label" not in header:
+    skipped = 0
+    with open(chars_csv, "r", encoding="utf-8", newline="") as f:
+        rdr = csv.DictReader(f)
+        if rdr.fieldnames is None or "label" not in rdr.fieldnames:
             raise ValueError("chars.csv missing 'label' column.")
-        for line in f:
-            line = line.strip()
-            if not line:
+        for rec in rdr:
+            if rec is None:
                 continue
-            cols = line.split(",")
-            if len(cols) != len(header):
+            label = (rec.get("label") or "").strip()
+            if not label:
+                skipped += 1
                 continue
-            rec = dict(zip(header, cols))
             rows.append(rec)
+    if skipped:
+        print(
+            f"[warn] Skipped {skipped} rows with empty/missing label", file=sys.stderr
+        )
     return rows
 
 
