@@ -883,6 +883,37 @@ def train_phase2(cfg: Phase2Config):
         f"[INFO] Phase 2 Training | device={device} | train={len(train_ds)} val={len(val_ds)} test={len(test_ds)} | labels={num_labels}",
         flush=True,
     )
+    # Reconstruct best.pt symlink/copy if missing (e.g., after cleanup)
+    best_link = ckpt_dir / "best.pt"
+    if not best_link.exists():
+        import re
+
+        epoch_ckpts = []
+        for p in ckpt_dir.glob("epoch*-val*.pt"):
+            m = re.match(r"epoch(\\d+)-val", p.name)
+            if m:
+                try:
+                    epoch_ckpts.append((int(m.group(1)), p))
+                except ValueError:
+                    pass
+        if epoch_ckpts:
+            epoch_ckpts.sort(key=lambda x: x[0], reverse=True)
+            _, best_candidate = epoch_ckpts[0]
+            try:
+                if best_link.exists() or best_link.is_symlink():
+                    best_link.unlink()
+                # Prefer symlink; fallback to copy
+                try:
+                    best_link.symlink_to(best_candidate.name)
+                except Exception:
+                    import shutil
+
+                    shutil.copy2(best_candidate, best_link)
+                print(
+                    f"[INFO] Reconstructed best.pt -> {best_candidate.name}", flush=True
+                )
+            except Exception as e:
+                print(f"[warn] Failed to reconstruct best.pt: {e}", file=sys.stderr)
 
     for epoch in range(start_epoch + 1, epochs + 1):
         start_time = time.time()
@@ -1302,12 +1333,17 @@ def train_phase2(cfg: Phase2Config):
         num_classes=num_labels,
         track_subset_diacritic=track_diacritic,
     )
-    macro_f1_test = None
+    macro_f1_test_seen = None
+    macro_f1_test_all = None
     if "confusion" in test_stats:
-        macro_f1_test = compute_macro_f1(test_stats["confusion"].float())
+        conf_test = test_stats["confusion"].float()
+        training_seen_mask = (class_counts > 0) if "class_counts" in locals() else None
+        macro_f1_test_all = compute_macro_f1(conf_test, None)
+        macro_f1_test_seen = compute_macro_f1(conf_test, training_seen_mask)
     print(
         f"[TEST] loss={test_stats['loss']:.4f} acc@1={test_stats['accuracy_top1']:.4f} "
-        f"acc@5={test_stats['accuracy_top5']:.4f} macroF1_seen={(macro_f1_test or 0):.4f} "
+        f"acc@5={test_stats['accuracy_top5']:.4f} macroF1_seen={(macro_f1_test_seen or 0):.4f} "
+        f"macroF1_all={(macro_f1_test_all or 0):.4f} "
         f"{'(dia=' + format(test_stats.get('diacritic_subset_accuracy', 0.0), '.4f') + ')' if track_diacritic else ''}",
         flush=True,
     )
