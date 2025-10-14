@@ -11,6 +11,7 @@
 #   4. Assign every cell to nearest centroid.
 #   5. (Optional) Primitive frequency statistics.
 #   6. Train Phase 1 CNN (primitive classifier).
+#   7. (Optional) Overlay visualization on unseen glyphs (Phase 1 centroid coverage QA).
 #
 # Each step is idempotent where possible (skips if expected outputs already exist)
 # unless --force is provided.
@@ -21,8 +22,9 @@
 #   ./run.sh --no-train           # stop after assignments
 #   ./run.sh --force              # re-run all steps (overwrite)
 #   ./run.sh --skip <step>        # skip a named step (can repeat)
-#                                  steps: rasterize, extract, kmeans, assign, stats, train
+#                                  steps: rasterize, extract, kmeans, assign, stats, train, overlay
 #   ./run.sh --only <step>        # run only the named step (ignores others & --no-train)
+#                                  (valid for --only / --skip: rasterize, extract, kmeans, assign, stats, train, overlay)
 #
 #   ./run.sh --dry-run            # print the commands without executing
 #
@@ -242,6 +244,33 @@ step_train() {
 # Orchestrate              #
 ############################
 
+step_overlay() {
+  if safe_skip_steps && contains overlay "${SKIP_STEPS[@]}"; then
+    log "SKIP overlay (user requested)"
+    return
+  fi
+  # Only run if a checkpoint exists; otherwise warn and skip.
+  local CKPT_DIR="checkpoints/phase1"
+  if [[ ! -d "$CKPT_DIR" ]]; then
+    log "Overlay skipped (no checkpoint directory $CKPT_DIR yet)."
+    return
+  fi
+  # Use existing centroids + latest checkpoint to visualize coverage on unseen glyphs.
+  local OUT_DIR="output/unseen_overlays"
+  mkdir -p "$OUT_DIR"
+  log "Generating unseen glyph overlay visualization..."
+  run_cmd "python -m eval.phase1_unseen_overlay \
+    --db dataset/glyphs.db \
+    --raster-config configs/rasterizer.yaml \
+    --centroids assets/centroids/primitive_centroids.npy \
+    --checkpoint-dir checkpoints/phase1 \
+    --out-dir $OUT_DIR \
+    --panel-out $OUT_DIR/panel.png \
+    --sample 20 \
+    --seed 123"
+  log "Overlay visualization complete (see $OUT_DIR)."
+}
+
 main() {
   log "=== Phase 1 Pipeline Start (dry-run=$DRY_RUN) ==="
   if safe_skip_steps; then
@@ -255,11 +284,12 @@ main() {
       rasterize) step_rasterize ;;
       extract)   step_extract_cells ;;
       kmeans)    step_kmeans ;;
+      overlay)   step_overlay ;;
       assign)    step_assign ;;
       stats)     step_stats ;;
       train)     step_train ;;
       *)
-        die "Unknown --only step: $ONLY_STEP (valid: rasterize, extract, kmeans, assign, stats, train)"
+        die "Unknown --only step: $ONLY_STEP (valid: rasterize, extract, kmeans, assign, stats, train, overlay)"
         ;;
     esac
   else
@@ -269,6 +299,7 @@ main() {
     step_assign
     step_stats
     step_train
+    step_overlay
   fi
   log "=== Pipeline Complete ==="
 }
