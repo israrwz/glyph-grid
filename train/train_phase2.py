@@ -336,7 +336,7 @@ def compute_macro_f1(confusion: torch.Tensor) -> float:
     recall = tp / torch.clamp(tp + fn, min=1)
     f1 = 2 * precision * recall / torch.clamp(precision + recall, min=1e-12)
     valid = (confusion.sum(dim=1) > 0).float()
-    macro = (f1 * valid).sum().item() / torch.clamp(valid.sum().item(), min=1.0)
+    macro = (f1 * valid).sum().item() / max(1.0, valid.sum().item())
     return macro
 
 
@@ -439,7 +439,12 @@ def run_epoch(
 
             if track_subset_diacritic:
                 # diacritic_flags is a list[bool] or tensor; convert to mask
-                mask = torch.tensor(diacritic_flags, dtype=torch.bool, device=device)
+                if isinstance(diacritic_flags, torch.Tensor):
+                    mask = diacritic_flags.to(device=device)
+                else:
+                    mask = torch.as_tensor(
+                        diacritic_flags, dtype=torch.bool, device=device
+                    )
                 subset_count = mask.sum().item()
                 if subset_count > 0:
                     subset_total += subset_count
