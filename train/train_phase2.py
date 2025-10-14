@@ -62,6 +62,7 @@ import os
 import random
 import sys
 import time
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -717,6 +718,10 @@ def train_phase2(cfg: Phase2Config):
     # New logging / limiting parameters
     log_interval_steps = int(training_cfg.get("log_interval_steps", 100) or 100)
     limit_train_batches = training_cfg.get("limit_train_batches", None)
+    # Token ID dropout probability (randomly replace primitive IDs with 0 / EMPTY during training)
+    token_id_dropout = float(training_cfg.get("token_id_dropout", 0.0) or 0.0)
+    # Resume support (path or env var PHASE2_RESUME)
+    resume_from = training_cfg.get("resume_from") or os.environ.get("PHASE2_RESUME")
     if isinstance(limit_train_batches, float) and 0 < limit_train_batches <= 1:
         # Interpret as fraction of total steps
         # Will resolve after DataLoader is built (need len(train_loader))
@@ -764,13 +769,57 @@ def train_phase2(cfg: Phase2Config):
             )
 
     top_checkpoints: List[Tuple[float, Path]] = []
+    start_epoch = 0
+    if resume_from:
+        rp = Path(resume_from)
+        if rp.exists():
+            try:
+                payload = torch.load(rp, map_location=device)
+                model.load_state_dict(payload.get("model_state", {}))
+                if "optimizer_state" in payload:
+                    optimizer.load_state_dict(payload["optimizer_state"])
+                if scheduler and "scheduler_state" in payload:
+                    try:
+                        scheduler.load_state_dict(payload["scheduler_state"])
+                    except Exception:
+                        pass
+                start_epoch = int(payload.get("epoch", 0))
+                metrics_payload = payload.get("metrics", {})
+                if monitor_mode == "max":
+                    best_score = metrics_payload.get("val_accuracy_top1", best_score)
+                else:
+                    best_score = metrics_payload.get("val_loss", best_score)
+                print(
+                    f"[RESUME] Loaded checkpoint '{resume_from}' (epoch {start_epoch})",
+                    flush=True,
+                )
+                # Establish / refresh best.pt symlink
+                best_link = ckpt_dir / "best.pt"
+                try:
+                    if best_link.exists() or best_link.is_symlink():
+                        best_link.unlink()
+                    if rp.parent == ckpt_dir:
+                        best_link.symlink_to(rp.name)
+                    else:
+                        shutil.copy2(rp, best_link)
+                except Exception:
+                    pass
+            except Exception as e:
+                print(
+                    f"[warn] Failed to resume from {resume_from}: {e}", file=sys.stderr
+                )
+        else:
+            print(
+                f"[warn] resume_from path does not exist: {resume_from}",
+                file=sys.stderr,
+            )
 
     print(
         f"[INFO] Phase 2 Training | device={device} | train={len(train_ds)} val={len(val_ds)} test={len(test_ds)} | labels={num_labels}",
         flush=True,
     )
 
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch + 1, epochs + 1):
         start_time = time.time()
 
         # Training epoch
@@ -792,6 +841,12 @@ def train_phase2(cfg: Phase2Config):
             grids, labels, glyph_ids, diacritic_flags = batch
             grids = grids.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
+            # Token ID dropout augmentation
+            if token_id_dropout > 0.0 and model.training:
+                # Replace a random subset of primitive IDs with 0 (EMPTY)
+                rand_mask = torch.rand_like(grids.float()) < token_id_dropout
+                if rand_mask.any():
+                    grids = grids.masked_fill(rand_mask, 0)
             with torch.cuda.amp.autocast(
                 enabled=mixed_precision and device.type == "cuda"
             ):
@@ -1006,6 +1061,17 @@ def train_phase2(cfg: Phase2Config):
                 },
                 scheduler=scheduler,
             )
+            # Maintain best.pt symlink (or copy fallback)
+            best_link = ckpt_dir / "best.pt"
+            try:
+                if best_link.exists() or best_link.is_symlink():
+                    best_link.unlink()
+                best_link.symlink_to(ckpt_path.name)
+            except Exception:
+                try:
+                    shutil.copy2(ckpt_path, best_link)
+                except Exception:
+                    pass
             top_checkpoints.append((val_stats["accuracy_top1"], ckpt_path))
             top_checkpoints.sort(key=lambda x: x[0], reverse=True)
             if len(top_checkpoints) > save_top_k:
