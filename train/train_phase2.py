@@ -697,11 +697,56 @@ def train_phase2(cfg: Phase2Config):
     model.to(device)
 
     # Loss / Optim / Scheduler
-    loss_fn = build_loss(cfg.get("loss", default={}) or {})
+    loss_cfg = cfg.get("loss", default={}) or {}
+    loss_fn = build_loss(loss_cfg)
     optimizer = build_optimizer(model, cfg.get("optim", default={}) or {})
     epochs = int(training_cfg.get("epochs", 40))
     scheduler_cfg = cfg.get("scheduler", default={}) or {}
     scheduler = build_scheduler(optimizer, scheduler_cfg, total_epochs=epochs)
+
+    # ------------------------------------------------------------------
+    # Auto inverse-frequency class weighting (Bundle 2)
+    # Trigger when loss.class_weights == 'auto_inverse_freq'
+    # Computes weights: w_i = (N / (count_i + eps)) ** alpha, normalized to mean=1
+    # ------------------------------------------------------------------
+    class_weight_mode = (
+        loss_cfg.get("class_weights") if isinstance(loss_cfg, dict) else None
+    ) or None
+    if class_weight_mode == "auto_inverse_freq":
+        # Build frequency map from training glyph IDs
+        class_counts = torch.zeros(num_labels, dtype=torch.float)
+        for gid in train_ids:
+            label_str = glyph_to_label.get(gid)
+            if label_str is None:
+                continue
+            idx = label_map.get(label_str)
+            if idx is not None:
+                class_counts[idx] += 1
+        eps = 1.0
+        total = class_counts.sum().item()
+        alpha = float(loss_cfg.get("class_weights_alpha", 0.4))
+        inv = (total / (class_counts + eps)) ** alpha
+        inv[class_counts == 0] = (
+            0.0  # unseen classes remain 0 (will be ignored by loss smoothing)
+        )
+        # Normalize to mean 1 over seen classes
+        seen = class_counts > 0
+        if seen.any():
+            inv_seen_mean = inv[seen].mean()
+            if inv_seen_mean > 0:
+                inv = inv / inv_seen_mean
+        # Rebuild loss_fn with weights if using CrossEntropyLoss
+        if isinstance(loss_fn, torch.nn.CrossEntropyLoss):
+            smoothing = float(loss_cfg.get("label_smoothing", 0.0) or 0.0)
+            loss_fn = torch.nn.CrossEntropyLoss(
+                weight=inv.to(device),
+                label_smoothing=smoothing if smoothing > 0 else 0.0,
+            )
+            print(
+                "[INFO] Applied auto inverse-frequency class weights "
+                f"(alpha={alpha}, mean={inv[seen].mean().item():.3f})",
+                flush=True,
+            )
 
     early_cfg = cfg.get("early_stopping", default={}) or {}
     use_early = bool(early_cfg.get("enabled", True))
@@ -960,6 +1005,38 @@ def train_phase2(cfg: Phase2Config):
         macro_f1 = None
         if "confusion" in val_stats:
             macro_f1 = compute_macro_f1(val_stats["confusion"].float())
+            # ------------------------------------------------------------------
+            # Diagnostics: label coverage & per-class accuracy histogram
+            # ------------------------------------------------------------------
+            try:
+                conf = val_stats["confusion"]
+                true_counts = conf.sum(dim=1)
+                correct_diag = torch.diag(conf)
+                nonzero = (true_counts > 0).sum().item()
+                covered = (correct_diag > 0).sum().item()
+                coverage_pct = 100.0 * covered / max(1, nonzero)
+                # Per-class accuracy for seen classes
+                acc_per_class = torch.zeros_like(true_counts, dtype=torch.float)
+                seen_mask = true_counts > 0
+                acc_per_class[seen_mask] = (
+                    correct_diag[seen_mask].float() / true_counts[seen_mask].float()
+                )
+                # Histogram bins
+                bins = [0.0, 0.1, 0.3, 0.5, 0.7, 0.9, 1.000001]
+                bin_counts = [0] * (len(bins) - 1)
+                apc = acc_per_class[seen_mask].tolist()
+                for v in apc:
+                    for b in range(len(bins) - 1):
+                        if bins[b] <= v < bins[b + 1]:
+                            bin_counts[b] += 1
+                            break
+                print(
+                    f"[VAL][diag] coverage={covered}/{nonzero} ({coverage_pct:.1f}%) "
+                    f"acc_hist={bin_counts}",
+                    flush=True,
+                )
+            except Exception as diag_e:
+                print(f"[warn] diagnostics failed: {diag_e}", file=sys.stderr)
 
         # Scheduler step
         current_lr = optimizer.param_groups[0]["lr"]

@@ -63,52 +63,52 @@ input:
 # ------------------------------------------------------------------
 # Model Definition (Section 7.2.A)
 # ------------------------------------------------------------------
+# model:
+#   architecture: cnn
+#   # architecture: transformer
+#   cnn:
+#     stages: [64, 128, 192] # or omit to auto-generate
+#     blocks_per_stage: [2, 2, 2]
+#     dropout: 0.1
+#     activation: gelu
+#     kernel_size: 3
+#     stem_kernel_size: 3
+#     stem_stride: 1
+#     downsample: conv
+#     classifier_hidden_dim: 0 # 0 => single linear
+#     classifier_dropout: 0.1
 model:
   architecture: cnn
-  # architecture: transformer
-  cnn:
-    stages: [64, 128, 192] # or omit to auto-generate
-    blocks_per_stage: [2, 2, 2]
+  transformer:
+    num_layers: 5 # Plan: 4–6 → picked midpoint
+    d_model: 256
+    num_heads: 8
+    mlp_hidden_dim: 512
+    dropout: 0.1
+    attention_dropout: 0.1
+    layer_norm_eps: 1.0e-5
+    pre_norm: true
+  classifier:
+    hidden_dim: 256 # Single linear if hidden_dim == d_model; can add MLP later
     dropout: 0.1
     activation: gelu
+  # CNN alternative architecture configuration (used when model.architecture: cnn)
+  cnn:
+    stages: [64, 128, 192]
+    blocks_per_stage: [2, 2, 2]
     kernel_size: 3
     stem_kernel_size: 3
     stem_stride: 1
     downsample: conv
-    classifier_hidden_dim: 0 # 0 => single linear
-    classifier_dropout: 0.1
-  model:
-    architecture: transformer
-    transformer:
-      num_layers: 5 # Plan: 4–6 → picked midpoint
-      d_model: 256
-      num_heads: 8
-      mlp_hidden_dim: 512
-      dropout: 0.1
-      attention_dropout: 0.1
-      layer_norm_eps: 1.0e-5
-      pre_norm: true
-    classifier:
-      hidden_dim: 256 # Single linear if hidden_dim == d_model; can add MLP later
-      dropout: 0.1
-      activation: gelu
-    # CNN alternative architecture configuration (used when model.architecture: cnn)
-    cnn:
-      stages: [64, 128, 192]
-      blocks_per_stage: [2, 2, 2]
-      kernel_size: 3
-      stem_kernel_size: 3
-      stem_stride: 1
-      downsample: conv
-      activation: gelu
-      dropout: 0.1
-      classifier_hidden_dim: 0 # 0 => single linear head
-      classifier_dropout: 0.2 # Increased from 0.1 (quick win regularization)
-    init:
-      embedding_from_centroids: true # Initialize primitive embeddings from centroids (row 0 for EMPTY as zeros)
-      centroid_requires_grad: true
-      cls_init: normal
-      weight_init: xavier_uniform
+    activation: gelu
+    dropout: 0.1
+    classifier_hidden_dim: 0 # 0 => single linear head
+    classifier_dropout: 0.2 # Increased from 0.1 (quick win regularization)
+  init:
+    embedding_from_centroids: true # Initialize primitive embeddings from centroids (row 0 for EMPTY as zeros)
+    centroid_requires_grad: true
+    cls_init: normal
+    weight_init: xavier_uniform
 
 # ------------------------------------------------------------------
 # Optimization & Training (Section 7.3)
@@ -134,17 +134,18 @@ scheduler:
 
 training:
   epochs: 40 # Plan: 30–50
-  batch_size: 8 # 128
-  eval_batch_size: 16 # 256
-  num_workers: 0
+  batch_size: 256 # 128
+  eval_batch_size: 256 # 256
+  num_workers: 2
   pin_memory: true
   gradient_accumulation_steps: 1
   log_interval_steps: 1 # 100
   token_id_dropout: 0.02 # fraction of primitive IDs randomly zeroed each train step
-  resume_from: null # path to checkpoint to resume (or set via PHASE2_RESUME env var)
   val_interval_epochs: 1
   save_every_epochs: 1
   mixed_precision: amp # {none | amp}
+  # resume_from: null # path to checkpoint to resume (or set via PHASE2_RESUME env var)
+  resume_from: checkpoints/phase2/epoch12-val0.6824.pt
 
 early_stopping:
   enabled: true
@@ -159,7 +160,8 @@ early_stopping:
 loss:
   primary: cross_entropy
   label_smoothing: 0.05
-  class_weights: null # Optional path to JSON {class_index: weight}
+  class_weights: auto_inverse_freq # enabled auto inverse frequency weights
+  class_weights_alpha: 0.4
   auxiliary_diacritic:
     enabled: false # Optional auxiliary (Section 7.3 table, weight 0.1)
     weight: 0.1
