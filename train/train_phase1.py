@@ -112,6 +112,7 @@ class TrainConfig:
     seed: int
     deterministic: bool
     data: Dict[str, Any]
+    vocabulary: Dict[str, Any]
     model: Dict[str, Any]
     optim: Dict[str, Any]
     scheduler: Dict[str, Any]
@@ -140,6 +141,7 @@ class TrainConfig:
             seed=raw.get("seed", 42),
             deterministic=raw.get("deterministic", True),
             data=section("data"),
+            vocabulary=section("vocabulary"),
             model=section("model"),
             optim=section("optim"),
             scheduler=section("scheduler"),
@@ -201,6 +203,7 @@ class PrimitiveCellDataset(Dataset):
         transform=None,
         empty_class_id: int = 0,
         empty_sampling_ratio: float = 0.1,
+        return_cell_id: bool = False,
     ):
         super().__init__()
         self.cells_dir = cells_dir
@@ -208,6 +211,7 @@ class PrimitiveCellDataset(Dataset):
         self.transform = transform
         self.empty_class_id = empty_class_id
         self.empty_sampling_ratio = float(empty_sampling_ratio)
+        self.return_cell_id = bool(return_cell_id)
         if not (0.0 < self.empty_sampling_ratio <= 1.0):
             raise ValueError("empty_sampling_ratio must be in (0,1].")
 
@@ -345,6 +349,8 @@ class PrimitiveCellDataset(Dataset):
         if self.transform:
             tensor = self.transform(tensor)
 
+        if self.return_cell_id:
+            return tensor, label, cid
         return tensor, label
 
     # ---------------------------------------------
@@ -630,9 +636,17 @@ def run_epoch(
     # Store dicts with 'pred','target','cell' (the 8x8 tensor CPU numpy) for rendering
     misclassified: List[Dict[str, Any]] = []
 
-    for batch_idx, (x, y) in enumerate(loader):
+    for batch_idx, batch in enumerate(loader):
+        # Support optional (x,y,cell_ids) when dataset was created with return_cell_id=True
+        if isinstance(batch, (list, tuple)) and len(batch) == 3:
+            x, y, cell_ids = batch
+        else:
+            x, y = batch  # type: ignore
+            cell_ids = None
         x = x.to(device, non_blocking=True)
         y = torch.as_tensor(y, device=device, dtype=torch.long)
+        if cell_ids is not None and hasattr(cell_ids, "to"):
+            cell_ids = cell_ids.to(device, non_blocking=True)
 
         with torch.cuda.amp.autocast(enabled=mixed_precision and device.type == "cuda"):
             logits = model(x)
@@ -681,13 +695,17 @@ def run_epoch(
                     if len(misclassified) >= max_misclassified_keep:
                         break
                     cell_patch = x[midx].detach().cpu().numpy()  # (1,8,8) float
-                    misclassified.append(
-                        {
-                            "pred": int(preds_full[midx].item()),
-                            "target": int(y[midx].item()),
-                            "cell": cell_patch.squeeze(0),  # (8,8)
-                        }
-                    )
+                    rec: Dict[str, Any] = {
+                        "pred": int(preds_full[midx].item()),
+                        "target": int(y[midx].item()),
+                        "cell": cell_patch.squeeze(0),  # (8,8)
+                    }
+                    if cell_ids is not None:
+                        try:
+                            rec["cell_id"] = int(cell_ids[midx].item())
+                        except Exception:
+                            pass
+                    misclassified.append(rec)
 
             # Frequency bucket stats (requires dataset frequency information embedded via loader.dataset)
             if bucket_stats:
@@ -755,6 +773,7 @@ def train_phase1(cfg: TrainConfig) -> None:
         split_file=train_split,
         empty_class_id=empty_class_id,
         empty_sampling_ratio=float(cfg.data.get("empty_sampling_ratio", 0.1)),
+        return_cell_id=True,
     )
 
     # Validation dataset (keep all empties for unbiased metrics)
@@ -764,6 +783,7 @@ def train_phase1(cfg: TrainConfig) -> None:
         split_file=val_split,
         empty_class_id=empty_class_id,
         empty_sampling_ratio=1.0,
+        return_cell_id=True,
     )
 
     # Test dataset (optional). If no test split provided, reuse val_ds reference.
@@ -774,6 +794,7 @@ def train_phase1(cfg: TrainConfig) -> None:
             split_file=test_split,
             empty_class_id=empty_class_id,
             empty_sampling_ratio=1.0,
+            return_cell_id=True,
         )
         if test_split
         else val_ds
@@ -927,48 +948,143 @@ def train_phase1(cfg: TrainConfig) -> None:
                 except Exception:
                     font = None
                 max_samples = int(render_cfg.get("max_samples_per_epoch", 50))
+                # Load centroids once (expects with-empty at index 0). Fallback to None if missing.
+                import json
+                import numpy as np
+
+                centroids = None
+                centroid_path = (
+                    Path(getattr(cfg, "vocabulary", {}).get("centroid_file", ""))
+                    if hasattr(cfg, "vocabulary")
+                    else None
+                )
+                if centroid_path and centroid_path.exists():
+                    try:
+                        centroids = np.load(centroid_path)
+                    except Exception as _e:
+                        centroids = None
                 samples = val_stats.get("misclassified", [])[:max_samples]
+                mis_index = []
                 for idx, rec in enumerate(samples):
                     cell = rec.get("cell")
                     if cell is None:
                         continue
                     pred = rec["pred"]
                     target = rec["target"]
-                    # Retrieve a prototype-like target panel (reuse same cell since we don't have centroid render here)
-                    # Left: actual cell, Right: same cell annotated with pred/target (for now)
-                    arr_query = (
+                    cell_id = rec.get("cell_id", None)
+                    # Prepare cell array (binary 0/255)
+                    arr_cell = (
                         (cell * 255.0).astype("uint8")
                         if cell.max() <= 1.0
                         else cell.astype("uint8")
                     )
-                    # Create matched panel as placeholder (could be centroid lookup later)
-                    arr_pred = arr_query.copy()
-                    h, w = arr_query.shape
-                    if layout == "horizontal":
-                        W = w * scale * 2 + gap
-                        H = h * scale
+
+                    # Derive centroid panels (reshape 8x8). Handle empty or missing gracefully.
+                    def get_centroid(pid: int):
+                        if centroids is None:
+                            return np.zeros_like(arr_cell)
+                        if pid < 0 or pid >= len(centroids):
+                            return np.zeros_like(arr_cell)
+                        vec = centroids[pid]
+                        if vec.shape[0] != 64:
+                            return np.zeros_like(arr_cell)
+                        return (vec.reshape(8, 8) * 255.0).clip(0, 255).astype("uint8")
+
+                    arr_pred_centroid = get_centroid(pred)
+                    arr_target_centroid = get_centroid(target)
+                    # Binarize centroids for XOR visualization (threshold 128)
+                    pred_bin = (arr_pred_centroid >= 128).astype("uint8")
+                    target_bin = (arr_target_centroid >= 128).astype("uint8")
+                    cell_bin = (arr_cell >= 128).astype("uint8")
+                    xor_pred = ((cell_bin ^ pred_bin) * 255).astype("uint8")
+                    xor_target = ((cell_bin ^ target_bin) * 255).astype("uint8")
+                    # Distances (L2) between cell (0/1) vector and centroid (normalized 0..1)
+                    if centroids is not None and 0 <= pred < len(centroids):
+                        cell_vec = cell_bin.reshape(-1).astype("float32")
+                        pred_vec = (centroids[pred].reshape(-1)).astype("float32")
+                        target_vec = (
+                            centroids[target].reshape(-1).astype("float32")
+                            if 0 <= target < len(centroids)
+                            else np.zeros_like(cell_vec)
+                        )
+                        dist_pred = float(np.linalg.norm(cell_vec - pred_vec))
+                        dist_target = float(np.linalg.norm(cell_vec - target_vec))
                     else:
-                        W = w * scale
-                        H = h * scale * 2 + gap
-                    canvas = Image.new("L", (W, H), color=bg_val)
-                    cell_img = Image.fromarray(arr_query, mode="L").resize(
-                        (w * scale, h * scale), Image.NEAREST
-                    )
-                    pred_img = Image.fromarray(arr_pred, mode="L").resize(
-                        (w * scale, h * scale), Image.NEAREST
-                    )
-                    if layout == "horizontal":
-                        canvas.paste(cell_img, (0, 0))
-                        canvas.paste(pred_img, (w * scale + gap, 0))
-                    else:
-                        canvas.paste(cell_img, (0, 0))
-                        canvas.paste(pred_img, (0, h * scale + gap))
+                        dist_pred = float("nan")
+                        dist_target = float("nan")
+                    # Compose 5 panels horizontally: cell | pred_centroid | target_centroid | XOR(cell,pred) | XOR(cell,target)
+                    panels = [
+                        ("cell", arr_cell),
+                        ("pred", arr_pred_centroid),
+                        ("target", arr_target_centroid),
+                        ("xor_pred", xor_pred),
+                        ("xor_target", xor_target),
+                    ]
+                    h, w = arr_cell.shape
+                    panel_w = w * scale
+                    panel_h = h * scale
+                    gap_count = len(panels) - 1
+                    W = panel_w * len(panels) + gap * gap_count
+                    H = panel_h
+                    canvas = Image.new("RGBA", (W, H), color=(0, 0, 0, 0))
+                    # Paste panels
+                    for p_i, (_label, arr) in enumerate(panels):
+                        img_mode = "L"
+                        # XOR panels: optionally colorize (xor_pred -> red, xor_target -> blue)
+                        if _label == "xor_pred":
+                            # map grayscale to RGBA red
+                            rgba = np.zeros((h, w, 4), dtype="uint8")
+                            rgba[..., 0] = arr  # Red
+                            rgba[..., 3] = (arr > 0) * 127  # alpha 50%
+                            panel_img = Image.fromarray(rgba, mode="RGBA")
+                        elif _label == "xor_target":
+                            rgba = np.zeros((h, w, 4), dtype="uint8")
+                            rgba[..., 2] = arr  # Blue
+                            rgba[..., 3] = (arr > 0) * 127
+                            panel_img = Image.fromarray(rgba, mode="RGBA")
+                        else:
+                            panel_img = Image.fromarray(arr, mode=img_mode).convert(
+                                "RGBA"
+                            )
+                        panel_img = panel_img.resize((panel_w, panel_h), Image.NEAREST)
+                        x_off = p_i * (panel_w + gap)
+                        canvas.paste(panel_img, (x_off, 0), panel_img)
                     if annotate:
                         draw = ImageDraw.Draw(canvas)
-                        text = f"pred={pred} target={target}"
-                        draw.text((4, 4), text, fill=fg_val, font=font)
-                    out_path = out_dir / f"mis_{idx:02d}_p{pred}_t{target}.png"
+                        text = f"pred={pred} target={target} dp={dist_pred:.2f} dt={dist_target:.2f}"
+                        draw.text((4, 4), text, fill=(255, 255, 255, 255), font=font)
+                        if cell_id is not None:
+                            draw.text(
+                                (4, 4 + font_size + 2),
+                                f"id={cell_id}",
+                                fill=(200, 200, 200, 255),
+                                font=font,
+                            )
+                    out_path = (
+                        out_dir / f"mis_{idx:02d}_cid{cell_id}_p{pred}_t{target}.png"
+                    )
                     canvas.save(out_path)
+                    mis_index.append(
+                        {
+                            "cell_id": int(cell_id) if cell_id is not None else None,
+                            "pred": pred,
+                            "target": target,
+                            "dist_pred": dist_pred,
+                            "dist_target": dist_target,
+                            "image": out_path.as_posix(),
+                        }
+                    )
+                # Write per-epoch JSON index
+                try:
+                    with (out_dir / "misclassified_index.json").open(
+                        "w", encoding="utf-8"
+                    ) as jf:
+                        json.dump(mis_index, jf, ensure_ascii=False, indent=2)
+                except Exception as _e:
+                    print(
+                        f"[warn] Failed writing misclassified_index.json: {_e}",
+                        file=sys.stderr,
+                    )
             except Exception as e:
                 print(
                     f"[warn] Failed rendering misclassified samples: {e}",

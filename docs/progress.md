@@ -1,5 +1,7 @@
 # Hierarchical Glyph Recognition Project - Implementation Progress
 
+_Update (2025-10-14): Implemented Misclassification Visualization Upgrades (now rendering panels: cell | predicted centroid | target centroid | XOR(cell,pred) | XOR(cell,target) with L2 distances and per-epoch JSON index) and added Phase 1 inference overlay script (`eval/phase1_inference_visualize.py`) that overlays matched centroid shapes (semi‑transparent red) onto full 128×128 glyph rasters._
+
 _Last updated: 2025-10-13 (Hybrid diacritic integration complete; next focus: Phase 1 training bootstrap & primitive pipeline)._
 
 ## 1. Scope Recap (from NEW_PLAN.md)
@@ -188,4 +190,38 @@ Immediate (next session):
 
 ---
 
-_This document was updated after Cairo integration and hybrid diacritic detection. Subsequent update (2025-10-13): clarified that the current 16×16 occupancy grid (single-bit per 8×8 cell) is an auxiliary coarse structural channel and is **not** used as the sole Phase 1 input because it irreversibly discards intra‑cell stroke geometry. Phase 1 will operate on the full 8×8 binary cell patches (retained via the 128×128 rasters) for primitive learning. Next immediate focus: (1) consolidate full cell corpus, (2) run K-Means to produce primitive centroids, (3) materialize Phase 1 dataset (cells → primitive IDs), and (4) implement & launch Phase 1 CNN training pipeline (bootstrap of end-to-end training)._
+_This document was updated after Cairo integration and hybrid diacritic detection. Subsequent update (2025-10-13): clarified that the current 16×16 occupancy grid (single-bit per 8×8 cell) is an auxiliary coarse structural channel and is **not** used as the sole Phase 1 input because it irreversibly discards intra‑cell stroke geometry. Phase 1 will operate on the full 8×8 binary cell patches (retained via the 128×128 rasters) for primitive learning. Next immediate focus (original list): (1) consolidate full cell corpus, (2) run K-Means to produce primitive centroids, (3) materialize Phase 1 dataset (cells → primitive IDs), and (4) implement & launch Phase 1 CNN training pipeline (bootstrap of end-to-end training)._
+
+**Added follow-up TODOs (next session focus):**
+1. Misclassification visualization upgrades:
+   - Return `cell_id` from dataset (validation/test) for traceability.
+   - Render panels: cell | predicted centroid | target centroid | XOR(cell,pred) | XOR(cell,target).
+   - Annotate distances (L2) to predicted vs true centroid.
+   - Write per-epoch JSON index of misclassified samples (ids, pred, target, distances, file paths).
+2. Centroid diagnostics:
+   - Compute pairwise centroid distances; generate duplicate/near-duplicate report (`duplicate_report.json`) with threshold (e.g. < 0.05 L2).
+   - Consider merging or flagging duplicate centroid pairs.
+3. Primitive frequency instrumentation:
+   - Attach `primitive_frequency` map to dataset to activate bucket accuracy metrics.
+   - Auto-generate frequency buckets (e.g. [10,100,1000,10000]).
+4. Enhanced metrics:
+   - Implement sparse confusion matrix (top-N confusing primitive pairs).
+   - Persist per-bucket accuracies & non-empty accuracy trend to CSV.
+5. Model ablations:
+   - Smaller CNN (channels 16/32; flatten=128; FC hidden=64).
+   - Pure MLP baselines (64→128→1024, 64→256→1024).
+   - Linear softmax baseline (64→1024) for lower bound.
+   - Record accuracy delta & parameter count; decide production Phase 1 architecture.
+6. Optional optimization:
+   - Add depthwise-separable conv variant & compare params/latency.
+7. Training ergonomics:
+   - Export centroid-prototype thumbnails grid for quick visual QA.
+   - Early-stop tightening (patience 3–4) once enhanced metrics confirm plateau.
+8. Data quality checks:
+   - Report proportion of misclassifications where dp≈dt (ambiguous cluster boundary).
+   - Flag any misclassified sample where both distances >> typical intra-cluster radius (outlier detection).
+9. Housekeeping:
+   - Add `--only` + `--dry-run` documentation to README / developer docs.
+   - Integrate improved visualization path & duplicate report into `run.sh` (optional new `diagnose` step).
+
+_These TODOs will be executed before moving to Phase 2 dataset materialization and transformer training._

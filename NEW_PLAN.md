@@ -1,6 +1,8 @@
 # Hierarchical Glyph Recognition Project Plan
 Independent Architecture & Implementation Specification
 
+> NOTE (2025-10-14): Phase 1 misclassification visualization enhancements and inference overlay tool `eval/phase1_inference_visualize.py` implemented. The script overlays predicted primitive centroids (semi‑transparent red) across the 16×16 cell grid of 128×128 glyph rasters for qualitative inspection of primitive assignments.
+
 ## 1. Purpose & Scope
 Build a high‑accuracy, font‑invariant recognizer for ~1.3K Arabic (and related) glyph classes (isolated forms, contextual variants, diacritics, ligatures). Emphasis:
 - Robust generalization across thousands of fonts.
