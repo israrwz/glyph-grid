@@ -100,7 +100,7 @@ def _fallback_overlay_centroids(
     raster: np.ndarray,
     centroid_ids: np.ndarray,
     centroids: np.ndarray,
-    alpha: int = 128,
+    alpha: int = 218,
 ) -> Image.Image:
     base = Image.fromarray(raster, mode="L").convert("RGBA")
     overlay = Image.new("RGBA", (128, 128), (0, 0, 0, 0))
