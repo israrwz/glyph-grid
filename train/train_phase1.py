@@ -211,7 +211,9 @@ class PrimitiveCellDataset(Dataset):
         empty_class_id: int = 0,
         empty_sampling_ratio: float = 0.1,
         return_cell_id: bool = False,
+        eager_decode_bitpack: bool = False,
     ):
+        self._eager_decode_bitpack = bool(eager_decode_bitpack)
         super().__init__()
         self.cells_dir = cells_dir
         self.assignments_file = assignments_file
@@ -449,8 +451,6 @@ class PrimitiveCellDataset(Dataset):
             for sp in sorted(root.glob("cells_bitpack_shard_*.npy")):
                 arr = np.load(sp, mmap_mode="r")  # uint64 vector
                 length = len(arr)
-                # We add a 'decoded' field (None initially). On first access we will
-                # vector-decode the entire shard into uint8 (N,8,8) and cache it.
                 self._shard_index.append(
                     {
                         "start": cumulative,
@@ -461,6 +461,12 @@ class PrimitiveCellDataset(Dataset):
                         "decoded": None,  # lazy full-shard decode cache
                     }
                 )
+                # Optional eager full-shard decode (trades memory for speed)
+                if self._eager_decode_bitpack:
+                    bytes_view = arr.view(np.uint8).reshape(-1, 8)
+                    bits = np.unpackbits(bytes_view, axis=1)
+                    decoded = (bits.reshape(-1, 8, 8) * 255).astype(np.uint8)
+                    self._shard_index[-1]["decoded"] = decoded
                 cumulative += length
         else:
             raise NotImplementedError("LMDB / other formats not implemented here.")
@@ -677,6 +683,9 @@ def run_epoch(
     empty_class_id: int = 0,
     freq_bucket_boundaries: Sequence[int] | None = None,
 ) -> Dict[str, float]:
+    import time as _time
+
+    _epoch_start_wall = _time.time()
     """
     Extended epoch runner:
       - Tracks top1 / top5
@@ -812,6 +821,8 @@ def run_epoch(
         "loss": total_loss / max(1, total_samples),
         "accuracy_top1": total_correct1 / max(1, total_samples),
         "accuracy_top5": total_correct5 / max(1, total_samples),
+        "samples_per_sec": total_samples
+        / max(1e-6, (_time.time() - _epoch_start_wall)),
     }
     if total_nonempty > 0:
         metrics["nonempty_accuracy_top1"] = total_nonempty_correct1 / total_nonempty
@@ -858,6 +869,7 @@ def train_phase1(cfg: TrainConfig) -> None:
         empty_class_id=empty_class_id,
         empty_sampling_ratio=float(cfg.data.get("empty_sampling_ratio", 0.1)),
         return_cell_id=True,
+        eager_decode_bitpack=bool(cfg.data.get("eager_decode_bitpack", False)),
     )
 
     # Validation dataset (keep all empties for unbiased metrics)
@@ -868,6 +880,7 @@ def train_phase1(cfg: TrainConfig) -> None:
         empty_class_id=empty_class_id,
         empty_sampling_ratio=1.0,
         return_cell_id=True,
+        eager_decode_bitpack=bool(cfg.data.get("eager_decode_bitpack", False)),
     )
 
     # Test dataset (optional). If no test split provided, reuse val_ds reference.
@@ -879,6 +892,7 @@ def train_phase1(cfg: TrainConfig) -> None:
             empty_class_id=empty_class_id,
             empty_sampling_ratio=1.0,
             return_cell_id=True,
+            eager_decode_bitpack=bool(cfg.data.get("eager_decode_bitpack", False)),
         )
         if test_split
         else val_ds
@@ -1213,7 +1227,9 @@ def train_phase1(cfg: TrainConfig) -> None:
                 f"| Val: loss={val_stats['loss']:.4f} acc@1={val_stats['accuracy_top1']:.4f} "
                 f"(nonempty={val_stats.get('nonempty_accuracy_top1', 0.0):.4f}) "
                 f"acc@5={val_stats['accuracy_top5']:.4f} | lr={current_lr:.3e} "
-                f"time={epoch_time:.1f}s",
+                f"time={epoch_time:.1f}s "
+                f"| train_ips={train_stats.get('samples_per_sec', 0):.0f} "
+                f"val_ips={val_stats.get('samples_per_sec', 0):.0f}",
                 flush=True,
             )
 

@@ -42,6 +42,7 @@ data:
   test_split: data/processed/cells_bitpack_subset80k_nomani/phase1_test_cells.txt
   empty_class_id: 0
   empty_sampling_ratio: 0.05 # More aggressive empty downsampling for speed
+  eager_decode_bitpack: true
 
 # ------------------------------------------------------------------
 # Vocabulary
