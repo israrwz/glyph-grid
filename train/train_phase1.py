@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# TODO(memmap_dataset): I need the current full contents (with line numbers) of this file to safely
+# insert the mmap-backed dataset implementation. Please provide the latest version of
+# train_phase1.py (or at least the sections around the dataset class and the DataLoader
+# construction) so I can produce a precise minimal diff using the required edit format.
 """
 Phase 1 Training Script (Primitive Cell Classification)
 
@@ -868,42 +872,151 @@ def train_phase1(cfg: TrainConfig) -> None:
         Path(data_cfg.get("test_split", "")) if data_cfg.get("test_split") else None
     )
 
-    # Training dataset (apply empty cell downsampling)
-    train_ds = PrimitiveCellDataset(
-        cells_dir=cells_dir,
-        assignments_file=assignments_file,
-        split_file=train_split,
-        empty_class_id=empty_class_id,
-        empty_sampling_ratio=float(cfg.data.get("empty_sampling_ratio", 0.1)),
-        return_cell_id=True,
-        eager_decode_bitpack=bool(cfg.data.get("eager_decode_bitpack", False)),
+    # Dataset selection: if a consolidated_dir (memmapped uint8 cells) is provided in config,
+    # bypass PrimitiveCellDataset and use a lightweight mmap dataset for near-zero CPU overhead.
+    consolidated_dir = (
+        Path(data_cfg.get("consolidated_dir"))
+        if data_cfg.get("consolidated_dir")
+        else None
+    )
+    use_mmap = (
+        consolidated_dir
+        and (consolidated_dir / "cells_uint8.npy").exists()
+        and (consolidated_dir / "labels_uint16.npy").exists()
     )
 
-    # Validation dataset (keep all empties for unbiased metrics)
-    val_ds = PrimitiveCellDataset(
-        cells_dir=cells_dir,
-        assignments_file=assignments_file,
-        split_file=val_split,
-        empty_class_id=empty_class_id,
-        empty_sampling_ratio=1.0,
-        return_cell_id=True,
-        eager_decode_bitpack=bool(cfg.data.get("eager_decode_bitpack", False)),
-    )
+    if use_mmap:
+        import numpy as np
 
-    # Test dataset (optional). If no test split provided, reuse val_ds reference.
-    test_ds = (
-        PrimitiveCellDataset(
+        print(
+            f"[DATA] Using consolidated mmap dataset at {consolidated_dir}", flush=True
+        )
+        cells_uint8 = np.load(
+            consolidated_dir / "cells_uint8.npy", mmap_mode="r"
+        )  # (N,8,8) uint8
+        labels_arr = np.load(
+            consolidated_dir / "labels_uint16.npy", mmap_mode="r"
+        )  # (N,) uint16 (65535=missing)
+
+        def _build_index(split_path: Path | None, empty_sampling_ratio: float):
+            ids = []
+            if split_path and split_path.exists():
+                with split_path.open("r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        cid = int(line)
+                        if cid >= len(labels_arr):
+                            continue
+                        pid = int(labels_arr[cid])
+                        if pid == 65535:
+                            continue
+                        if pid == empty_class_id and empty_sampling_ratio < 1.0:
+                            import random
+
+                            if random.random() >= empty_sampling_ratio:
+                                continue
+                        ids.append(cid)
+            else:
+                # Fallback: all valid ids
+                for cid in range(len(labels_arr)):
+                    pid = int(labels_arr[cid])
+                    if pid == 65535:
+                        continue
+                    ids.append(cid)
+            return np.asarray(ids, dtype=np.int32)
+
+        class MMapCellDataset(torch.utils.data.Dataset):
+            def __init__(self, indices: np.ndarray):
+                self.indices = indices
+
+            def __len__(self):
+                return len(self.indices)
+
+            def __getitem__(self, i: int):
+                cid = int(self.indices[i])
+                cell = cells_uint8[cid]  # (8,8) uint8 {0,255}
+                lbl = int(labels_arr[cid])
+                # Convert to tensor (1,8,8) float32 0/1
+                tensor = torch.from_numpy((cell > 0).astype("float32")).unsqueeze(0)
+                return tensor, lbl, cid
+
+        train_indices = _build_index(
+            train_split, float(cfg.data.get("empty_sampling_ratio", 0.1))
+        )
+        val_indices = _build_index(val_split, 1.0)
+        test_indices = _build_index(test_split, 1.0) if test_split else val_indices
+
+        train_ds = MMapCellDataset(train_indices)
+        val_ds = MMapCellDataset(val_indices)
+        test_ds = MMapCellDataset(test_indices)
+
+        # For mmap dataset we do NOT need the custom collate (already returns tensors)
+        custom_collate = None
+    else:
+        # Fallback: original bitpack / shard dataset
+        train_ds = PrimitiveCellDataset(
             cells_dir=cells_dir,
             assignments_file=assignments_file,
-            split_file=test_split,
+            split_file=train_split,
+            empty_class_id=empty_class_id,
+            empty_sampling_ratio=float(cfg.data.get("empty_sampling_ratio", 0.1)),
+            return_cell_id=True,
+            eager_decode_bitpack=bool(cfg.data.get("eager_decode_bitpack", False)),
+        )
+        val_ds = PrimitiveCellDataset(
+            cells_dir=cells_dir,
+            assignments_file=assignments_file,
+            split_file=val_split,
             empty_class_id=empty_class_id,
             empty_sampling_ratio=1.0,
             return_cell_id=True,
             eager_decode_bitpack=bool(cfg.data.get("eager_decode_bitpack", False)),
         )
-        if test_split
-        else val_ds
-    )
+        test_ds = (
+            PrimitiveCellDataset(
+                cells_dir=cells_dir,
+                assignments_file=assignments_file,
+                split_file=test_split,
+                empty_class_id=empty_class_id,
+                empty_sampling_ratio=1.0,
+                return_cell_id=True,
+                eager_decode_bitpack=bool(cfg.data.get("eager_decode_bitpack", False)),
+            )
+            if test_split
+            else val_ds
+        )
+
+        # Reuse earlier batch decode collate for PrimitiveCellDataset path
+        def custom_collate(batch):
+            import numpy as np, torch
+
+            cells_raw, labels, cell_ids = [], [], []
+            first_cell = batch[0][0]
+            is_array = hasattr(first_cell, "shape") and getattr(
+                first_cell, "shape", None
+            ) == (8, 8)
+            for item in batch:
+                if len(item) == 3:
+                    cell, lbl, cid = item
+                else:
+                    cell, lbl = item
+                    cid = -1
+                labels.append(int(lbl))
+                cell_ids.append(int(cid))
+                cells_raw.append(cell)
+            if is_array:
+                arr = np.stack(cells_raw, axis=0).astype(np.uint8)
+            else:
+                raw_masks = np.asarray(cells_raw, dtype=np.uint64)
+                bytes_view = raw_masks.view(np.uint8).reshape(-1, 8)
+                bits = np.unpackbits(bytes_view, axis=1)
+                arr = bits.reshape(-1, 8, 8).astype(np.uint8)
+            tensor = torch.from_numpy((arr > 0).astype("float32")).unsqueeze(1)
+            labels_t = torch.as_tensor(labels, dtype=torch.long)
+            cell_ids_t = torch.as_tensor(cell_ids, dtype=torch.int64)
+            return tensor, labels_t, cell_ids_t
 
     print(
         f"[DATA] empty_sampling_ratio(train)={cfg.data.get('empty_sampling_ratio', 0.1)} | "
@@ -934,36 +1047,8 @@ def train_phase1(cfg: TrainConfig) -> None:
         num_workers = recommended_workers
 
     # Custom collate: batch decode bitpacked masks to tensors
-    def _batch_decode_collate(batch):
-        import numpy as np, torch
-
-        cells_raw = []
-        labels = []
-        cell_ids = []
-        first_cell = batch[0][0]
-        is_array = hasattr(first_cell, "shape") and getattr(
-            first_cell, "shape", None
-        ) == (8, 8)
-        for item in batch:
-            if len(item) == 3:
-                cell, lbl, cid = item
-            else:
-                cell, lbl = item
-                cid = -1
-            labels.append(int(lbl))
-            cell_ids.append(int(cid))
-            cells_raw.append(cell)
-        if is_array:
-            arr = np.stack(cells_raw, axis=0).astype(np.uint8)
-        else:
-            raw_masks = np.asarray(cells_raw, dtype=np.uint64)
-            bytes_view = raw_masks.view(np.uint8).reshape(-1, 8)
-            bits = np.unpackbits(bytes_view, axis=1)  # (N,64)
-            arr = bits.reshape(-1, 8, 8).astype(np.uint8)
-        tensor = torch.from_numpy((arr > 0).astype("float32")).unsqueeze(1)  # (N,1,8,8)
-        labels_t = torch.as_tensor(labels, dtype=torch.long)
-        cell_ids_t = torch.as_tensor(cell_ids, dtype=torch.int64)
-        return tensor, labels_t, cell_ids_t
+    # Select collate function depending on dataset type
+    collate_fn = custom_collate if not use_mmap else None
 
     train_loader = DataLoader(
         train_ds,
@@ -974,7 +1059,7 @@ def train_phase1(cfg: TrainConfig) -> None:
         drop_last=False,
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
         persistent_workers=persistent_workers,
-        collate_fn=_batch_decode_collate,
+        collate_fn=collate_fn,
     )
     val_loader = DataLoader(
         val_ds,
@@ -985,7 +1070,7 @@ def train_phase1(cfg: TrainConfig) -> None:
         drop_last=False,
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
         persistent_workers=persistent_workers,
-        collate_fn=_batch_decode_collate,
+        collate_fn=collate_fn,
     )
 
     # Model

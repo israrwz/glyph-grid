@@ -43,6 +43,7 @@ data:
   empty_class_id: 0
   empty_sampling_ratio: 0.05 # More aggressive empty downsampling for speed
   eager_decode_bitpack: true
+  consolidated_dir: data/processed/cells_bitpack_consolidated
 
 # ------------------------------------------------------------------
 # Vocabulary
