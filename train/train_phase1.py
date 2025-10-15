@@ -61,6 +61,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+import functools
 
 # ---------------------------------------------------------------------------
 # Third-party imports with guarded fallbacks
@@ -126,6 +127,7 @@ class TrainConfig:
     debug: Dict[str, Any]
     sanity: Dict[str, Any]
     misclassified_render: Dict[str, Any]
+    loader: Dict[str, Any]  # NEW: explicit loader section support
 
     @staticmethod
     def from_yaml(path: str | Path) -> "TrainConfig":
@@ -155,6 +157,7 @@ class TrainConfig:
             debug=section("debug"),
             sanity=section("sanity"),
             misclassified_render=section("misclassified_render"),
+            loader=section("loader"),
         )
 
 
@@ -223,52 +226,79 @@ class PrimitiveCellDataset(Dataset):
             raise FileNotFoundError(f"cells_dir missing: {cells_dir}")
 
         self._cell_source = CellSource(cells_dir)
-        # Shard / array indexing structures for fast random access:
-        #  - consolidated_npy: keep a single mmap reference
-        #  - sharded_npy: build a list of (start, end, path) and cache mmap objects on demand
+        # Shard / array indexing structures for fast random access
         self._consolidated_array = None
-        self._shard_index = None  # list[dict]: {"start":int,"end":int,"path":Path,"array":np.memmap or ndarray}
+        self._shard_index = None
 
-        # Load assignments
-        self._assign_map: Dict[int, int] = self._load_assignments(assignments_file)
+        # Assignment storage (mutually exclusive)
+        self._assign_map: Optional[Dict[int, int]] = None
+        self._assign_dense = None
+        self._dense_missing = None  # sentinel for missing
 
-        # Restrict to split
-        if split_file and split_file.exists():
-            chosen_ids = self._load_split_ids(split_file)
-            # Filter to intersection
-            filtered = {
-                cid: self._assign_map[cid]
-                for cid in chosen_ids
-                if cid in self._assign_map
-            }
-            self._assign_map = filtered
+        # Load assignments (map or dense)
+        if assignments_file.suffix.lower() == ".npy":
+            import numpy as np
 
-        # Build deterministic ordered index (apply empty downsampling if enabled)
-        base_ids: List[int] = sorted(self._assign_map.keys())
-        if self.empty_sampling_ratio < 1.0:
+            self._assign_dense = np.load(assignments_file, mmap_mode="r")
+            # Heuristic sentinel: if dtype is uint16 and max value == 65535 treat as missing
+            if self._assign_dense.dtype == np.uint16:
+                self._dense_missing = 65535
+            else:
+                self._dense_missing = -1
+        else:
+            self._assign_map = self._load_assignments(assignments_file)
+
+        # Split handling & downsampling
+        if self._assign_dense is not None:
             import random as _random
 
+            # Build candidate id list
+            if split_file and split_file.exists():
+                candidate_ids = self._load_split_ids(split_file)
+            else:
+                candidate_ids = range(len(self._assign_dense))
             kept: List[int] = []
-            for cid in base_ids:
-                pid = self._assign_map[cid]
-                if pid == self.empty_class_id:
-                    if _random.random() < self.empty_sampling_ratio:
-                        kept.append(cid)
-                else:
-                    kept.append(cid)
+            for cid in candidate_ids:
+                if cid >= len(self._assign_dense):
+                    continue
+                pid = int(self._assign_dense[cid])
+                if pid == self._dense_missing:
+                    continue
+                if pid == self.empty_class_id and self.empty_sampling_ratio < 1.0:
+                    if _random.random() >= self.empty_sampling_ratio:
+                        continue
+                kept.append(cid)
             self._cell_ids = kept
         else:
-            self._cell_ids = base_ids
+            # Dict path
+            if split_file and split_file.exists():
+                chosen_ids = self._load_split_ids(split_file)
+                filtered = {
+                    cid: self._assign_map[cid]
+                    for cid in chosen_ids
+                    if cid in self._assign_map
+                }
+                self._assign_map = filtered
+            base_ids: List[int] = sorted(self._assign_map.keys())
+            if self.empty_sampling_ratio < 1.0:
+                import random as _random
+
+                kept: List[int] = []
+                for cid in base_ids:
+                    pid = self._assign_map[cid]
+                    if pid == self.empty_class_id:
+                        if _random.random() < self.empty_sampling_ratio:
+                            kept.append(cid)
+                    else:
+                        kept.append(cid)
+                self._cell_ids = kept
+            else:
+                self._cell_ids = base_ids
 
         if len(self._cell_ids) == 0:
             raise RuntimeError(
                 "PrimitiveCellDataset empty after loading assignments/split/downsampling."
             )
-
-        # Quick sanity check
-        first_id = self._cell_ids[0]
-        if first_id not in self._assign_map:
-            raise RuntimeError("Internal indexing error (missing first cell id).")
 
     # ---------------------------------------------
     @staticmethod
@@ -327,22 +357,18 @@ class PrimitiveCellDataset(Dataset):
 
     # ---------------------------------------------
     @staticmethod
+    @functools.lru_cache(maxsize=4096)
     def _unpack_bitcell(mask: int):
         """
-        Unpack a uint64 bitmask into an (8,8) uint8 binary cell (0/255).
-        Bit (r*8 + c) corresponds to pixel (r,c). Uses set-bit iteration.
+        Vectorized unpack of a uint64 bitmask into (8,8) uint8 (0/255).
+        Cached to avoid repeated reconstruction for common patterns (e.g., EMPTY).
         """
         import numpy as np
 
-        out = np.zeros((8, 8), dtype=np.uint8)
-        bits = int(mask)
-        while bits:
-            lsb = bits & -bits
-            idx = lsb.bit_length() - 1
-            r, c = divmod(idx, 8)
-            out[r, c] = 255
-            bits ^= lsb
-        return out
+        b = np.frombuffer(np.uint64(mask).tobytes(), dtype=np.uint8)
+        bits = np.unpackbits(b)  # length 64
+        arr = (bits[:64].reshape(8, 8) * 255).astype(np.uint8)
+        return arr
 
     # ---------------------------------------------
     def __len__(self) -> int:
@@ -351,7 +377,12 @@ class PrimitiveCellDataset(Dataset):
     # ---------------------------------------------
     def __getitem__(self, index: int):
         cid = self._cell_ids[index]
-        label = self._assign_map[cid]
+        if self._assign_dense is not None:
+            label = int(self._assign_dense[cid])
+            if label == self._dense_missing:
+                raise RuntimeError(f"Accessed missing cell id {cid} in dense mapping.")
+        else:
+            label = self._assign_map[cid]
 
         # Retrieve cell bitmap from cell source
         # We iterate sources in order; direct random access requires small index->array mapping.
@@ -845,22 +876,16 @@ def train_phase1(cfg: TrainConfig) -> None:
         flush=True,
     )
 
-    loader_cfg = cfg.data  # reuse fields
-    batch_size = (
-        int(cfg.loader_get("batch_size", 1024))
-        if hasattr(cfg, "loader_get")
-        else int(cfg.training.get("batch_size", cfg.model.get("batch_size", 1024)))
-    )
-    # Prefer loader section if present
-    loader_section = (
-        getattr(cfg, "loader", None)
-        or cfg.__dict__.get("loader", None)
-        or cfg.__dict__.get("data", {})
-    )
+    # Loader configuration (now explicitly supported)
+    loader_section = getattr(cfg, "loader", {}) or {}
     batch_size = int(loader_section.get("batch_size", 1024))
     num_workers = int(loader_section.get("num_workers", 4))
     pin_memory = bool(loader_section.get("pin_memory", True))
     shuffle = bool(loader_section.get("shuffle", True))
+    prefetch_factor = loader_section.get("prefetch_factor", 2)
+    persistent_workers = (
+        bool(loader_section.get("persistent_workers", True)) and num_workers > 0
+    )
 
     train_loader = DataLoader(
         train_ds,
@@ -869,6 +894,8 @@ def train_phase1(cfg: TrainConfig) -> None:
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=False,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        persistent_workers=persistent_workers,
     )
     val_loader = DataLoader(
         val_ds,
@@ -877,6 +904,8 @@ def train_phase1(cfg: TrainConfig) -> None:
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=False,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        persistent_workers=persistent_workers,
     )
 
     # Model

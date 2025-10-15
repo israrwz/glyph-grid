@@ -1,0 +1,244 @@
+# Phase 1 (Primitive Cell Classification) Configuration
+# Aligned strictly with NEW_PLAN.md Sections:
+#  - 5  Cell Grid Extraction (16x16 grid, 8x8 cells)
+#  - 6.1 Primitive Vocabulary Initialization
+#  - 6.2 Baseline CNN Architecture
+#  - 6.3 Training Protocol
+#  - 6.4 Metrics
+#
+# Goal: Train a lightweight CNN that classifies individual 8x8 cell bitmaps
+# into 1024 primitive IDs (0 = EMPTY, 1..1023 = K-Means clusters).
+#
+# IMPORTANT: Per the plan, augmentation (translation, blur, gamma) is applied
+# on the full 128x128 glyph raster BEFORE slicing into cells. Therefore
+# per-cell augmentation is DISABLED here to preserve cell consistency.
+
+experiment_name: phase1_subset80k_baseline_v1
+run_notes: >
+  Subset (80K glyph) baseline. Uses reduced assignment & split files under cells_bitpack_subset80k
+  to cut RAM & speed iteration. Architecture & hyperparams unchanged from full baseline.
+
+# ------------------------------------------------------------------
+# Reproducibility
+# ------------------------------------------------------------------
+seed: 42
+deterministic: true # Use deterministic CuDNN kernels where possible
+benchmark: false
+
+# ------------------------------------------------------------------
+# Data
+# ------------------------------------------------------------------
+data:
+  # Directory containing cell tensors extracted from glyph rasters.
+  # Each record: (cell_id, glyph_id, row, col, primitive_label(optional init))
+  cells_dir: data/processed/cells_bitpack
+  # File mapping cell_id -> primitive_id (produced after K-Means assignment).
+  assignments_file: data/processed/cells_bitpack_subset80k/primitive_assignments_subset.parquet
+  # Optional: shard pattern (if using multiple parquet / lmdb shards).
+  shards_glob: null
+  # Image spec (each cell is exactly 8x8 per plan).
+  cell_size: 8
+  channels: 1
+  # Splits (lists of cell_ids) produced deterministically from font splits.
+  train_split: data/processed/cells_bitpack_subset80k/phase1_train_cells.txt
+  val_split: data/processed/cells_bitpack_subset80k/phase1_val_cells.txt
+  test_split: data/processed/cells_bitpack_subset80k/phase1_test_cells.txt
+  # Class 0 reserved for empty cell (all zeros).
+  empty_class_id: 0
+  # Downsampling ratio for empty cells in TRAIN split only (0,1]; validation/test keep all empties.
+  empty_sampling_ratio: 0.1
+
+# ------------------------------------------------------------------
+# Vocabulary
+# ------------------------------------------------------------------
+vocabulary:
+  primitive_count: 1024 # 0..1023 (0 = EMPTY)
+  reserve_empty: true
+  centroid_file: assets/centroids/primitive_centroids.npy # Produced by K-Means
+  centroid_dim: 64 # Raw flattened 8x8 -> 64D (before any projection)
+  # Whether to validate centroid count == primitive_count - 1 (excluding empty).
+  validate_centroids: true
+
+# ------------------------------------------------------------------
+# Data Loader
+# ------------------------------------------------------------------
+loader:
+  batch_size: 1024 # Plan specifies 1024
+  num_workers: 2
+  pin_memory: true
+  shuffle: true
+  drop_last: false
+  prefetch_factor: 2
+  persistent_workers: true
+
+# ------------------------------------------------------------------
+# Augmentation
+# ------------------------------------------------------------------
+# Disabled here (handled upstream on full raster prior to cell slicing).
+augment:
+  enabled: false
+  # Retained only as placeholders if future per-cell aug becomes necessary.
+  translate_px: 0
+  blur_sigma_max: 0.0
+  gamma_jitter: 0.0
+  note: "Per NEW_PLAN.md §6.3, augmentation happens on full raster, not per-cell."
+
+# ------------------------------------------------------------------
+# Model (Baseline CNN)  — mirrors Section 6.2 exactly
+# ------------------------------------------------------------------
+model:
+  type: "baseline_cnn_v1"
+  in_channels: 1
+  # Two convolutional blocks:
+  # Conv(32,3,pad=1)+BN+ReLU -> MaxPool(2)
+  # Conv(64,3,pad=1)+BN+ReLU -> MaxPool(2)
+  conv_blocks:
+    - { out_channels: 32, kernel: 3, stride: 1, padding: 1, batchnorm: true, pool: 2 }
+    - { out_channels: 64, kernel: 3, stride: 1, padding: 1, batchnorm: true, pool: 2 }
+  # After second pool: shape (64,2,2) -> 256 flatten
+  flatten_dim: 256
+  fc_hidden: 128
+  fc_dropout: 0.2 # Plan: Dropout(0.2) after FC(128)
+  num_classes: 1024
+  weight_init: kaiming_normal # Pragmatic default
+
+# ------------------------------------------------------------------
+# Optimization & Scheduling (Plan §6.3)
+# ------------------------------------------------------------------
+optim:
+  name: adamw
+  lr: 0.001 # lr=1e-3
+  weight_decay: 1.0e-4
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+scheduler:
+  strategy: cosine # Plan allows Cosine or OneCycle; choose cosine
+  warmup_epochs: 3
+  min_lr_scale: 0.1 # final_lr = base_lr * min_lr_scale
+  # Optional alternative (comment above out to use):
+  # strategy: onecycle
+  # max_lr: 0.001
+  # pct_start: 0.3
+  # div_factor: 25
+
+# ------------------------------------------------------------------
+# Training Loop
+# ------------------------------------------------------------------
+training:
+  epochs: 60 # Plan: 50–80; choose mid-point
+  early_stop:
+    patience: 8
+    min_delta: 0.0005
+    monitor: val/accuracy_top1
+    mode: max
+  log_interval_batches: 1
+  validate_every_epochs: 1
+  gradient_clip_norm: 5.0
+  mixed_precision: true
+  accumulate_batches: 1
+
+# ------------------------------------------------------------------
+# Loss
+# ------------------------------------------------------------------
+loss:
+  name: cross_entropy
+  label_smoothing: 0.0 # Optional in plan; default off
+  class_weights: null # Optional: path to weights for imbalance
+  focal:
+    enabled: false
+
+# ------------------------------------------------------------------
+# Metrics (Plan §6.4 + extra reporting)
+# ------------------------------------------------------------------
+metrics:
+  primary: accuracy_top1
+  report:
+    - accuracy_top1
+    - accuracy_top5
+    - freq_bucket_accuracy # Implement: buckets by primitive frequency
+    - confusion_matrix_sparse # Top confusions
+    - macro_f1
+    - support_per_class
+
+# ------------------------------------------------------------------
+# Checkpointing
+# ------------------------------------------------------------------
+checkpoint:
+  dir: checkpoints/phase1
+  monitor: val/accuracy_top1
+  mode: max
+  save_top_k: 3
+  save_last: true
+  filename_pattern: "epoch{epoch:02d}-val{val_accuracy_top1:.4f}.pt"
+
+# ------------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------------
+logging:
+  backend: tensorboard
+  tensorboard_dir: logs/phase1
+  run_name: "${experiment_name}"
+  csv_log_file: logs/phase1_metrics.csv
+  wandb:
+    enabled: false
+    project: glyph-grid
+    tags: ["phase1", "baseline"]
+
+# ------------------------------------------------------------------
+# Misclassified Rendering (Phase 1 diagnostics)
+# ------------------------------------------------------------------
+misclassified_render:
+  enabled: true # If true, render a composite image for each misclassified sample (pred vs target)
+  output_dir: logs/phase1_misclassified
+  max_samples_per_epoch: 50
+  layout: horizontal # horizontal | vertical
+  scale: 16 # Each 8x8 cell scaled by this factor (16 -> 128x128)
+  gap_px: 8 # Pixel gap between the two panels
+  bg_value: 0 # Background grayscale value
+  fg_value: 255 # Foreground grayscale value
+  annotate: true # Draw text labels (pred/target) if PIL font available
+  font_size: 14 # Annotation font size (ignored if annotate=false)
+
+# ------------------------------------------------------------------
+# Evaluation / Export
+# ------------------------------------------------------------------
+eval:
+  batch_size: 1024
+  num_workers: 8
+  export_embeddings: true
+  embeddings_path: artifacts/phase1_cell_embeddings.npy
+  confusion_matrix: true
+  qualitative_samples_per_class: 0
+
+export:
+  onnx: { enabled: true, path: artifacts/phase1_model.onnx, opset: 18 }
+  jit: { enabled: true, path: artifacts/phase1_model_jit.pt }
+  centroids:
+    recompute_from_assignments: false # Typically produced pre-training via K-Means
+    path: assets/centroids/primitive_centroids.npy
+
+# ------------------------------------------------------------------
+# Debug
+# ------------------------------------------------------------------
+debug:
+  fast_dev_run: false
+  limit_train_batches: null
+  limit_val_batches: null
+  overfit_batches: 0
+
+# ------------------------------------------------------------------
+# Sanity Checks
+# ------------------------------------------------------------------
+sanity:
+  verify_cell_size: 8
+  verify_class_range: true
+  min_samples_per_nonempty: 5
+# ------------------------------------------------------------------
+# Notes
+# ------------------------------------------------------------------
+# - Keep per-cell augmentation disabled (handled upstream).
+# - Increase epochs toward 80 only if clear continued improvement.
+# - Consider OneCycle if cosine underperforms early (swap scheduler).
+# - Implement freq_bucket_accuracy by stratifying primitives into
+#   logarithmic frequency bins for monitoring rare pattern performance.

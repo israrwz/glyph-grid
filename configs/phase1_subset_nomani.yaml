@@ -1,0 +1,226 @@
+# Phase 1 (Primitive Cell Classification) Configuration
+# Subset variant (no-manifest method): uses first / sampled 80K glyph block subset
+# built by build_subset_no_manifest.py (derives glyph indices via cell_id // 256).
+#
+# Differences from full baseline:
+#  - Points to filtered assignment & split files under cells_bitpack_subset80k_nomani
+#  - Keeps original bitpacked cell shards (no duplication of shard .npy files)
+#  - Same model & optimization hyperparameters for comparable behavior
+#
+# To switch to dense .npy mapping (faster startup, lower Python overhead),
+# change `assignments_file` below to:
+#   data/processed/cells_bitpack_subset80k_nomani/primitive_assignments_dense_uint16.npy
+#
+# NOTE: Ensure the subset directory contains:
+#   - primitive_assignments_subset.parquet
+#   - phase1_train_cells.txt / phase1_val_cells.txt / phase1_test_cells.txt
+#   - (optional) primitive_assignments_dense_uint16.npy
+
+experiment_name: phase1_subset80k_nomani_v1
+run_notes: >
+  80K glyph subset via block inference (cell_id//256). Faster iteration.
+  Switch to dense .npy mapping when ready for additional speed.
+
+# ------------------------------------------------------------------
+# Reproducibility
+# ------------------------------------------------------------------
+seed: 42
+deterministic: true
+benchmark: false
+
+# ------------------------------------------------------------------
+# Data
+# ------------------------------------------------------------------
+data:
+  cells_dir: data/processed/cells_bitpack
+  assignments_file: data/processed/cells_bitpack_subset80k_nomani/primitive_assignments_subset.parquet
+  shards_glob: null
+  cell_size: 8
+  channels: 1
+  train_split: data/processed/cells_bitpack_subset80k_nomani/phase1_train_cells.txt
+  val_split: data/processed/cells_bitpack_subset80k_nomani/phase1_val_cells.txt
+  test_split: data/processed/cells_bitpack_subset80k_nomani/phase1_test_cells.txt
+  empty_class_id: 0
+  empty_sampling_ratio: 0.1   # Downsample empties in TRAIN only
+
+# ------------------------------------------------------------------
+# Vocabulary
+# ------------------------------------------------------------------
+vocabulary:
+  primitive_count: 1024
+  reserve_empty: true
+  centroid_file: assets/centroids/primitive_centroids.npy
+  centroid_dim: 64
+  validate_centroids: true
+
+# ------------------------------------------------------------------
+# Data Loader
+# ------------------------------------------------------------------
+loader:
+  batch_size: 1024
+  num_workers: 8
+  pin_memory: true
+  shuffle: true
+  drop_last: false
+  prefetch_factor: 2
+  persistent_workers: true
+
+# ------------------------------------------------------------------
+# Augmentation (disabled; upstream raster aug)
+# ------------------------------------------------------------------
+augment:
+  enabled: false
+  translate_px: 0
+  blur_sigma_max: 0.0
+  gamma_jitter: 0.0
+  note: "Full-glyph augmentation applied pre-cell; keep per-cell aug off."
+
+# ------------------------------------------------------------------
+# Model
+# ------------------------------------------------------------------
+model:
+  type: baseline_cnn_v1
+  in_channels: 1
+  conv_blocks:
+    - { out_channels: 32, kernel: 3, stride: 1, padding: 1, batchnorm: true, pool: 2 }
+    - { out_channels: 64, kernel: 3, stride: 1, padding: 1, batchnorm: true, pool: 2 }
+  flatten_dim: 256
+  fc_hidden: 128
+  fc_dropout: 0.2
+  num_classes: 1024
+  weight_init: kaiming_normal
+
+# ------------------------------------------------------------------
+# Optimization
+# ------------------------------------------------------------------
+optim:
+  name: adamw
+  lr: 0.001
+  weight_decay: 1.0e-4
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+scheduler:
+  strategy: cosine
+  warmup_epochs: 3
+  min_lr_scale: 0.1
+
+# ------------------------------------------------------------------
+# Training Loop
+# ------------------------------------------------------------------
+training:
+  epochs: 40            # Slightly fewer for subset iteration
+  early_stop:
+    patience: 6
+    min_delta: 0.0005
+    monitor: val/accuracy_top1
+    mode: max
+  log_interval_batches: 1
+  validate_every_epochs: 1
+  gradient_clip_norm: 5.0
+  mixed_precision: true
+  accumulate_batches: 1
+
+# ------------------------------------------------------------------
+# Loss
+# ------------------------------------------------------------------
+loss:
+  name: cross_entropy
+  label_smoothing: 0.0
+  class_weights: null
+  focal:
+    enabled: false
+
+# ------------------------------------------------------------------
+# Metrics
+# ------------------------------------------------------------------
+metrics:
+  primary: accuracy_top1
+  report:
+    - accuracy_top1
+    - accuracy_top5
+    - freq_bucket_accuracy
+    - confusion_matrix_sparse
+    - macro_f1
+    - support_per_class
+
+# ------------------------------------------------------------------
+# Checkpointing
+# ------------------------------------------------------------------
+checkpoint:
+  dir: checkpoints/phase1_subset80k_nomani
+  monitor: val/accuracy_top1
+  mode: max
+  save_top_k: 3
+  save_last: true
+  filename_pattern: "epoch{epoch:02d}-val{val_accuracy_top1:.4f}.pt"
+
+# ------------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------------
+logging:
+  backend: tensorboard
+  tensorboard_dir: logs/phase1_subset80k_nomani
+  run_name: "${experiment_name}"
+  csv_log_file: logs/phase1_subset80k_nomani_metrics.csv
+  wandb:
+    enabled: false
+    project: glyph-grid
+    tags: ["phase1", "subset80k", "nomani"]
+
+# ------------------------------------------------------------------
+# Misclassified Rendering
+# ------------------------------------------------------------------
+misclassified_render:
+  enabled: true
+  output_dir: logs/phase1_subset80k_nomani_misclassified
+  max_samples_per_epoch: 40
+  layout: horizontal
+  scale: 16
+  gap_px: 8
+  bg_value: 0
+  fg_value: 255
+  annotate: true
+  font_size: 14
+
+# ------------------------------------------------------------------
+# Evaluation / Export
+# ------------------------------------------------------------------
+eval:
+  batch_size: 1024
+  num_workers: 8
+  export_embeddings: true
+  embeddings_path: artifacts/phase1_subset80k_nomani_cell_embeddings.npy
+  confusion_matrix: true
+  qualitative_samples_per_class: 0
+
+export:
+  onnx: { enabled: true, path: artifacts/phase1_subset80k_nomani_model.onnx, opset: 18 }
+  jit:  { enabled: true, path: artifacts/phase1_subset80k_nomani_model_jit.pt }
+  centroids:
+    recompute_from_assignments: false
+    path: assets/centroids/primitive_centroids.npy
+
+# ------------------------------------------------------------------
+# Debug
+# ------------------------------------------------------------------
+debug:
+  fast_dev_run: false
+  limit_train_batches: null
+  limit_val_batches: null
+  overfit_batches: 0
+
+# ------------------------------------------------------------------
+# Sanity
+# ------------------------------------------------------------------
+sanity:
+  verify_cell_size: 8
+  verify_class_range: true
+  min_samples_per_nonempty: 5
+
+# ------------------------------------------------------------------
+# Notes
+# ------------------------------------------------------------------
+# - Switch to dense .npy for faster startup when stable.
+# - Increase epochs if validation still improving after 40.
+# - Keep empty_sampling_ratio tuned; adjust to 0.05 if empties dominate after subset.
