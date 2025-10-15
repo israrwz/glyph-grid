@@ -489,6 +489,11 @@ class ShardedCellWriter:
         else:
             cells_arr = np.stack(self._cell_buf, axis=0).astype(np.uint8)
             out_cells = self.out_dir / f"cells_shard_{shard_id:03d}.npy"
+
+        # Persist cell shard (this was missing previously for bitpack path)
+        np.save(out_cells, cells_arr)
+        saved_cells = cells_arr.shape[0] if cells_arr.ndim > 1 else len(cells_arr)
+
         if self.binary_meta:
             meta_dtype = np.dtype(
                 [
@@ -521,8 +526,9 @@ class ShardedCellWriter:
                         )
                         + "\n"
                     )
+
         print(
-            f"[INFO] Wrote shard {shard_id}: cells {cells_arr.shape}, meta {len(self._meta_buf)} -> {out_cells}"
+            f"[INFO] Wrote shard {shard_id}: cells={saved_cells:,} bitpack={self.bitpack} meta={len(self._meta_buf):,} -> {out_cells}"
         )
         self._cell_buf.clear()
         self._cell_packed.clear()
