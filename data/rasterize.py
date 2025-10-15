@@ -1213,6 +1213,28 @@ def write_metadata_line(
 
 
 def run_rasterization(cfg: FullConfig, limit: int | None = None):
+    """
+    Rasterize glyphs with optional multiprocessing.
+
+    Parallelism control:
+      - Set environment variable RASTER_WORKERS=N to enable N worker processes.
+      - If unset or <=1, falls back to serial processing (original behavior).
+
+    Each worker:
+      - Parses contours
+      - Applies outlier / empty filtering
+      - Rasterizes + extracts grid
+      - Writes PNG + .npy
+      - Appends metadata line (atomic append per process)
+
+    NOTE: Appending to metadata file from multiple processes is safe on POSIX
+    (each open/write/close is effectively atomic for separate lines). If desired,
+    you can switch to a queue & single writer for stricter control.
+    """
+    import os
+    import re
+    import multiprocessing as mp
+
     rng = random.Random(cfg.seed)
     np.random.seed(cfg.seed)
 
@@ -1229,105 +1251,199 @@ def run_rasterization(cfg: FullConfig, limit: int | None = None):
     )
     kept = [r for r in rows_cache if r["label"] in whitelist]
 
-    print(f"[INFO] Total glyph rows: {len(rows_cache)} | After whitelist: {len(kept)}")
+    if limit is not None:
+        kept = kept[:limit]
+
+    total = len(kept)
+    print(f"[INFO] Total glyph rows: {len(rows_cache)} | After whitelist: {total}")
+
+    workers_env = os.environ.get("RASTER_WORKERS")
+    try:
+        workers = int(workers_env) if workers_env else 1
+    except ValueError:
+        workers = 1
+    if workers < 1:
+        workers = 1
 
     start_time = time.time()
-    processed = 0
-    skipped_empty = 0  # Count glyphs with zero vector subpaths (blank / unusable)
-    skipped_outlier = 0  # Count large diacritic outliers excluded from training
 
-    for r in kept:
-        # Use DB primary key 'id' for filenames; keep original glyph_id in metadata.
-        orig_glyph_id = r["glyph_id"]
-        db_id = r["id"]
-        label = r["label"]
-        contours_json = r.get("contours_json")
-        used_ascent = r.get("used_ascent")
-        used_descent = r.get("used_descent")
-        font_hash = r.get("font_hash", "")
-        char_class = r.get("char_class", "")
-        advance_width = r.get("advance_width")
+    # Serial fallback
+    if workers == 1:
+        processed = 0
+        skipped_empty = 0
+        skipped_outlier = 0
+        for r in kept:
+            orig_glyph_id = r["glyph_id"]
+            db_id = r["id"]
+            label = r["label"]
+            contours_json = r.get("contours_json")
+            used_ascent = r.get("used_ascent")
+            used_descent = r.get("used_descent")
+            font_hash = r.get("font_hash", "")
+            char_class = r.get("char_class", "")
+            advance_width = r.get("advance_width")
 
-        subpaths = parse_contours(contours_json)
-        if not subpaths:
-            skipped_empty += 1
-            continue
+            subpaths = parse_contours(contours_json)
+            if not subpaths:
+                skipped_empty += 1
+                continue
 
-        # Hybrid diacritic detection and outlier filtering
-        # First, compute ratio to determine if it's a diacritic
-        bounds_str = r.get("bounds")
-        if bounds_str:
+            bounds_str = r.get("bounds")
             try:
-                bounds = json.loads(bounds_str)
-                if bounds and len(bounds) == 4:
-                    min_x, min_y, max_x, max_y = bounds
-                    bbox_w = max_x - min_x
-                    bbox_h = max_y - min_y
-                    major_dim = max(bbox_w, bbox_h)
+                if bounds_str:
+                    bounds = json.loads(bounds_str)
+                    if bounds and len(bounds) == 4:
+                        min_x, min_y, max_x, max_y = bounds
+                        bbox_w = max_x - min_x
+                        bbox_h = max_y - min_y
+                        major_dim = max(bbox_w, bbox_h)
+                        em_height = (
+                            (used_ascent - used_descent)
+                            if (used_ascent and used_descent)
+                            else bbox_h
+                        )
+                        em_height = em_height if em_height != 0 else 1.0
+                        ratio = major_dim / em_height
+                        adv = advance_width if advance_width is not None else 1000
+                        is_diacritic_by_class = (
+                            "diacritic" in char_class.lower() if char_class else False
+                        )
+                        if is_diacritic_by_class and (adv >= 100 and ratio >= 0.15):
+                            skipped_outlier += 1
+                            continue
+            except Exception:
+                pass
 
-                    em_height = (
-                        (used_ascent - used_descent)
-                        if (used_ascent and used_descent)
-                        else bbox_h
-                    )
-                    em_height = em_height if em_height != 0 else 1.0
-                    ratio = major_dim / em_height
-
-                    # Hybrid rule: is_diacritic = (advance_width < 100) OR (ratio < 0.15)
-                    adv = advance_width if advance_width is not None else 1000
-                    is_diacritic_by_metrics = (adv < 100) or (ratio < 0.15)
-                    is_diacritic_by_class = (
-                        "diacritic" in char_class.lower() if char_class else False
-                    )
-
-                    # Exclude large diacritic outliers from training
-                    # These are diacritics (by class) that are rendered unusually large
-                    if is_diacritic_by_class and (adv >= 100 and ratio >= 0.15):
-                        skipped_outlier += 1
-                        continue
-            except:
-                pass  # If bounds parsing fails, proceed with rasterization
-
-        bitmap, meta = rasterize_glyph(
-            subpaths, used_ascent, used_descent, cfg, advance_width=advance_width
-        )
-
-        # Inject original glyph_id for traceability
-        meta["orig_glyph_id"] = orig_glyph_id
-
-        # Save raster named by DB primary key id
-        import re  # local import for filename sanitization
-
-        safe_label = re.sub(r"[^A-Za-z0-9._-]+", "_", label)[:64]
-        raster_path = cfg.paths.rasters_dir / f"{safe_label}_{db_id}.png"
-        Image.fromarray(bitmap, mode="L").save(
-            raster_path,
-            optimize=True,
-            compress_level=cfg.raster.store_mode == "binary_uint8",
-        )
-
-        # Record raster filename for reverse lookup in metadata
-        meta["raster_filename"] = raster_path.name
-
-        # Extract & save occupancy grid (also keyed by DB id)
-        grid = extract_cell_grid(bitmap, cfg)
-        np.save(cfg.paths.grids_dir / f"{db_id}.npy", grid, allow_pickle=False)
-
-        # Write metadata using db_id as glyph_id field, retaining orig_glyph_id inside meta
-        write_metadata_line(cfg.paths.metadata_path, db_id, label, font_hash, meta)
-
-        processed += 1
-        if limit is not None and processed >= limit:
-            print(f"[INFO] Reached glyph limit {limit}; stopping early.")
-            break
-        if processed % 1000 == 0:
-            elapsed = time.time() - start_time
-            print(
-                f"[INFO] Processed {processed} glyphs (skipped empty: {skipped_empty}, outliers: {skipped_outlier}) in {elapsed:.1f}s"
+            bitmap, meta = rasterize_glyph(
+                subpaths, used_ascent, used_descent, cfg, advance_width=advance_width
             )
+            meta["orig_glyph_id"] = orig_glyph_id
 
+            safe_label = re.sub(r"[^A-Za-z0-9._-]+", "_", label)[:64]
+            raster_path = cfg.paths.rasters_dir / f"{safe_label}_{db_id}.png"
+            Image.fromarray(bitmap, mode="L").save(
+                raster_path,
+                optimize=True,
+                compress_level=cfg.raster.store_mode == "binary_uint8",
+            )
+            meta["raster_filename"] = raster_path.name
+            grid = extract_cell_grid(bitmap, cfg)
+            np.save(cfg.paths.grids_dir / f"{db_id}.npy", grid, allow_pickle=False)
+            write_metadata_line(cfg.paths.metadata_path, db_id, label, font_hash, meta)
+
+            processed += 1
+            if processed % 1000 == 0:
+                elapsed = time.time() - start_time
+                print(
+                    f"[INFO] (serial) {processed}/{total} "
+                    f"(skipped empty: {skipped_empty}, outliers: {skipped_outlier}) "
+                    f"in {elapsed:.1f}s"
+                )
+
+        print(
+            f"[INFO] Completed rasterization of {processed} glyphs. Skipped empty: {skipped_empty}, outliers: {skipped_outlier}. Elapsed {time.time() - start_time:.1f}s"
+        )
+        return
+
+    # Parallel path
     print(
-        f"[INFO] Completed rasterization of {processed} glyphs. Skipped empty: {skipped_empty}, outliers: {skipped_outlier}. Elapsed {time.time() - start_time:.1f}s"
+        f"[INFO] Using multiprocessing with {workers} workers (set RASTER_WORKERS to change)."
+    )
+
+    def _worker(row):
+        # Returns tuple: (processed, skipped_empty, skipped_outlier)
+        try:
+            orig_glyph_id = row["glyph_id"]
+            db_id = row["id"]
+            label = row["label"]
+            contours_json = row.get("contours_json")
+            used_ascent = row.get("used_ascent")
+            used_descent = row.get("used_descent")
+            font_hash = row.get("font_hash", "")
+            char_class = row.get("char_class", "")
+            advance_width = row.get("advance_width")
+
+            subpaths = parse_contours(contours_json)
+            if not subpaths:
+                return (0, 1, 0)
+
+            # Outlier filtering
+            bounds_str = row.get("bounds")
+            try:
+                if bounds_str:
+                    bounds = json.loads(bounds_str)
+                    if bounds and len(bounds) == 4:
+                        min_x, min_y, max_x, max_y = bounds
+                        bbox_w = max_x - min_x
+                        bbox_h = max_y - min_y
+                        major_dim = max(bbox_w, bbox_h)
+                        em_height = (
+                            (used_ascent - used_descent)
+                            if (used_ascent and used_descent)
+                            else bbox_h
+                        )
+                        em_height = em_height if em_height != 0 else 1.0
+                        ratio = major_dim / em_height
+                        adv = advance_width if advance_width is not None else 1000
+                        is_diacritic_by_class = (
+                            "diacritic" in char_class.lower() if char_class else False
+                        )
+                        if is_diacritic_by_class and (adv >= 100 and ratio >= 0.15):
+                            return (0, 0, 1)
+            except Exception:
+                pass
+
+            bitmap, meta = rasterize_glyph(
+                subpaths, used_ascent, used_descent, cfg, advance_width=advance_width
+            )
+            meta["orig_glyph_id"] = orig_glyph_id
+
+            safe_label = re.sub(r"[^A-Za-z0-9._-]+", "_", label)[:64]
+            raster_path = cfg.paths.rasters_dir / f"{safe_label}_{db_id}.png"
+            Image.fromarray(bitmap, mode="L").save(
+                raster_path,
+                optimize=True,
+                compress_level=cfg.raster.store_mode == "binary_uint8",
+            )
+            meta["raster_filename"] = raster_path.name
+            grid = extract_cell_grid(bitmap, cfg)
+            np.save(cfg.paths.grids_dir / f"{db_id}.npy", grid, allow_pickle=False)
+            write_metadata_line(cfg.paths.metadata_path, db_id, label, font_hash, meta)
+            return (1, 0, 0)
+        except Exception as e:
+            # Optional: could log traceback; keep silent for speed
+            return (0, 0, 0)
+
+    processed = 0
+    skipped_empty = 0
+    skipped_outlier = 0
+    last_report = time.time()
+
+    with mp.Pool(processes=workers) as pool:
+        for i, (p, se, so) in enumerate(
+            pool.imap_unordered(_worker, kept, chunksize=64), 1
+        ):
+            processed += p
+            skipped_empty += se
+            skipped_outlier += so
+            if processed and processed % 2000 == 0:
+                now = time.time()
+                if now - last_report >= 5:
+                    elapsed = now - start_time
+                    rate = processed / elapsed if elapsed > 0 else 0
+                    print(
+                        f"[INFO] (mp) {processed}/{total} "
+                        f"(skipped empty: {skipped_empty}, outliers: {skipped_outlier}) "
+                        f"in {elapsed:.1f}s ({rate:.1f} glyphs/s)"
+                    )
+                    last_report = now
+
+    elapsed = time.time() - start_time
+    rate = processed / elapsed if elapsed > 0 else 0
+    print(
+        f"[INFO] Completed rasterization (mp) of {processed}/{total} glyphs. "
+        f"Skipped empty: {skipped_empty}, outliers: {skipped_outlier}. "
+        f"Elapsed {elapsed:.1f}s ({rate:.2f} glyphs/s)"
     )
 
 
