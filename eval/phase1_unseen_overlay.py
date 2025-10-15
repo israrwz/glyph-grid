@@ -174,6 +174,7 @@ class Args:
     sample: int
     seed: int
     alpha: int
+    flip: bool
     device: str
     sql_file: Optional[Path]
 
@@ -219,6 +220,11 @@ def parse_args(argv: Sequence[str]) -> Args:
     )
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--alpha", type=int, default=128, help="Overlay alpha (0-255).")
+    ap.add_argument(
+        "--flip",
+        action="store_true",
+        help="Horizontally flip centroid bitmaps before overlay (use if training decode was mirrored).",
+    )
     ap.add_argument("--device", type=str, default="auto", help="cuda|cpu|auto")
     ap.add_argument(
         "--sql-file",
@@ -238,6 +244,7 @@ def parse_args(argv: Sequence[str]) -> Args:
         sample=ns.sample,
         seed=ns.seed,
         alpha=ns.alpha,
+        flip=ns.flip,
         device=ns.device,
         sql_file=ns.sql_file,
     )
@@ -387,7 +394,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             continue
 
         grid_pred = batched_predict_cells(model, device, raster)
-        composite = overlay_fn(raster, grid_pred, centroids, alpha=args.alpha)
+        # If --flip is set, mirror centroid bitmaps horizontally prior to overlay by
+        # passing a horizontally flipped centroids view (equivalent to flipping each 8x8).
+        if args.flip:
+            # Create a lazily transformed centroids array without modifying original
+            centroids_for_overlay = centroids.copy()
+            centroids_for_overlay = centroids_for_overlay.reshape(-1, 8, 8)[
+                :, :, ::-1
+            ].reshape(centroids.shape[0], 64)
+            composite = overlay_fn(
+                raster, grid_pred, centroids_for_overlay, alpha=args.alpha
+            )
+        else:
+            composite = overlay_fn(raster, grid_pred, centroids, alpha=args.alpha)
         out_path = args.out_dir / f"glyph_{glyph_id}_overlay.png"
         composite.save(out_path)
 
