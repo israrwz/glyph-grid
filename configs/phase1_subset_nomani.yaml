@@ -59,7 +59,7 @@ vocabulary:
 # ------------------------------------------------------------------
 loader:
   batch_size: 4096
-  num_workers: 12
+  num_workers: 4
   pin_memory: true
   shuffle: true
   drop_last: false
@@ -189,7 +189,7 @@ misclassified_render:
 # ------------------------------------------------------------------
 eval:
   batch_size: 4096
-  num_workers: 12
+  num_workers: 4
   export_embeddings: true
   embeddings_path: artifacts/phase1_subset80k_nomani_cell_embeddings.npy
   confusion_matrix: true

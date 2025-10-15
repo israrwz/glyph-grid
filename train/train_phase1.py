@@ -270,7 +270,9 @@ class PrimitiveCellDataset(Dataset):
                     if _random.random() >= self.empty_sampling_ratio:
                         continue
                 kept.append(cid)
-            self._cell_ids = kept
+            import numpy as np
+
+            self._cell_ids = np.asarray(kept, dtype=np.int32)
         else:
             # Dict path
             if split_file and split_file.exists():
@@ -293,9 +295,13 @@ class PrimitiveCellDataset(Dataset):
                             kept.append(cid)
                     else:
                         kept.append(cid)
-                self._cell_ids = kept
+                import numpy as np
+
+                self._cell_ids = np.asarray(kept, dtype=np.int32)
             else:
-                self._cell_ids = base_ids
+                import numpy as np
+
+                self._cell_ids = np.asarray(base_ids, dtype=np.int32)
 
         if len(self._cell_ids) == 0:
             raise RuntimeError(
@@ -378,7 +384,7 @@ class PrimitiveCellDataset(Dataset):
 
     # ---------------------------------------------
     def __getitem__(self, index: int):
-        cid = self._cell_ids[index]
+        cid = int(self._cell_ids[index])
         if self._assign_dense is not None:
             label = int(self._assign_dense[cid])
             if label == self._dense_missing:
@@ -915,6 +921,16 @@ def train_phase1(cfg: TrainConfig) -> None:
     persistent_workers = (
         bool(loader_section.get("persistent_workers", True)) and num_workers > 0
     )
+    # System advisory cap (e.g. Kaggle often recommends <=4 workers). Allow override via env.
+    import os
+
+    recommended_workers = int(os.environ.get("PHASE1_MAX_WORKERS", 4))
+    if num_workers > recommended_workers:
+        print(
+            f"[warn] Reducing num_workers from {num_workers} to {recommended_workers} (system advisory).",
+            flush=True,
+        )
+        num_workers = recommended_workers
 
     train_loader = DataLoader(
         train_ds,
