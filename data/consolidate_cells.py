@@ -8,7 +8,7 @@ Purpose
 After running the rasterization pipeline (data/rasterize.py) we have:
 
   - Rasters: <rasters_dir>/<id>.png        (128x128 binary glyph mask; id = DB primary key)
-  - Grids:   <grids_dir>/<glyph_id>.npy          (16x16 occupancy grid: 0/1)
+  - Grids:   <grids_dir>/<glyph_id>.npy    (16x16 occupancy grid: 0/1)
   - (Optional) Primitive IDs: <grids_dir>/<glyph_id>_ids.npy (not used here)
 
 This script consolidates all 8x8 cell bitmaps into a contiguous storage layout
@@ -17,7 +17,7 @@ to accelerate:
   - Phase 1 training dataset assembly
   - Frequency / sparsity analytics
 
-It produces:
+It produces (standard mode):
   - cells.npy (or sharded cells_shard_<k>.npy) of shape (N, 8, 8) uint8
   - cells_meta.jsonl (or meta_shard_<k>.jsonl) with records:
         {
@@ -27,8 +27,18 @@ It produces:
           "col": <0..15>,
           "empty": <bool>
         }
-  - Optional reservoir sample of non-empty cells for K-Means:
-        kmeans_sample.npy  (M, 8, 8) uint8  (M <= requested size)
+
+Space‑optimized (bitpack) mode (--bitpack):
+  - cells_bitpack.npy (or cells_bitpack_shard_<k>.npy) shape (N,) uint64
+    Each uint64 packs an 8×8 binary cell (row-major; bit (r*8+c)).
+  - metadata can be written either as JSONL (default) or a binary .npy struct
+    if --binary-meta is passed (dtype fields: cell_id,glyph_id,row,col,empty:uint8).
+
+  Bitpacking shrinks each stored cell from 64 bytes → 8 bytes (8×). Combined
+  with --skip-empty-storage this dramatically reduces disk usage.
+
+Optional reservoir sample of non-empty cells for K-Means:
+  - kmeans_sample.npy  (M, 8, 8) uint8  (M <= requested size)
 
 Determinism
 -----------
@@ -38,30 +48,27 @@ Ordering is strictly:
 This ensures reproducible cell_id assignment across runs (as long as the
 underlying file set is stable).
 
-CLI
----
+CLI Examples
+------------
 Build consolidated corpus (single file):
-  python data/consolidate_cells.py \
-      --config configs/rasterizer.yaml \
-      --out-dir data/processed/cells
+  python data/consolidate_cells.py --config configs/rasterizer.yaml --out-dir data/processed/cells
 
-Shard output every 500k cells:
+Shard every 500k cells, skip empties, bitpack + binary metadata:
   python data/consolidate_cells.py \
       --config configs/rasterizer.yaml \
       --out-dir data/processed/cells \
-      --shard-size 500000
-
-Include ALL cells (default) or skip empty cells in storage:
-  (By default we store all cells; skipping empties saves space but complicates
-   index mapping for Phase 1.)
-  python data/consolidate_cells.py ... --skip-empty-storage
+      --shard-size 500000 \
+      --skip-empty-storage \
+      --bitpack \
+      --binary-meta
 
 Produce a 1M non-empty reservoir sample for K-Means simultaneously:
   python data/consolidate_cells.py \
       --config configs/rasterizer.yaml \
       --out-dir data/processed/cells \
       --kmeans-sample-size 1000000 \
-      --kmeans-sample-out assets/centroids/kmeans_sample.npy
+      --kmeans-sample-out assets/centroids/kmeans_sample.npy \
+      --bitpack --skip-empty-storage
 
 Exit Codes
 ----------
@@ -70,7 +77,8 @@ Exit Codes
 
 Notes
 -----
-* Memory: Sharding avoids holding the entire corpus in-memory.
+* Bitpacking + skipping empties can reduce disk usage by >10×.
+* Sharding avoids holding the entire corpus in-memory.
 * If a raster or grid file is missing or malformed, that glyph is skipped with a warning.
 * This script only uses config sections: outputs.rasters_dir, outputs.grids_dir.
 * It does not rely on primitive ID grids (_ids.npy) — those are a downstream artifact.
@@ -83,7 +91,7 @@ Sections utilized from NEW_PLAN.md:
   - §6.1 Primitive vocabulary sampling methodology
   - §9.1 Preprocessing tasks (cell slicing & storage)
 
-Author: Automated expert scaffold
+Author: Automated expert scaffold (extended with bitpacking & binary metadata options)
 """
 
 from __future__ import annotations
@@ -310,9 +318,33 @@ def extract_cells_from_glyph(
 # --------------------------------------------------------------------------------------
 
 
+def bitpack_cell(cell: np.ndarray) -> np.uint64:
+    """
+    Pack a binary 8x8 cell (values 0/255 or 0/1) into a uint64 bitmask.
+    Bit assignment (row-major): bit index = r * 8 + c.
+    Returns:
+        np.uint64 where bit i is 1 if the corresponding cell pixel was non-zero.
+    """
+    # Ensure uint8
+    if cell.dtype != np.uint8:
+        cell = cell.astype(np.uint8)
+    # Normalize >0 to 1
+    flat = (cell.reshape(-1) > 0).astype(np.uint8)
+    bits = 0
+    # Loop (64 iterations; negligible cost vs I/O)
+    for i, v in enumerate(flat):
+        if v:
+            bits |= 1 << i
+    return np.uint64(bits)
+
+
 class ShardedCellWriter:
     """
     Accumulates cells & metadata, flushing to shards when capacity reached.
+
+    Supports:
+      - bitpack mode (store each cell as uint64)
+      - binary metadata (structured ndarray) or JSONL
     """
 
     def __init__(
@@ -320,12 +352,18 @@ class ShardedCellWriter:
         out_dir: Path,
         shard_size: Optional[int],
         include_empty: bool,
+        bitpack: bool = False,
+        binary_meta: bool = False,
     ):
         self.out_dir = out_dir
         self.shard_size = shard_size if shard_size and shard_size > 0 else None
         self.include_empty = include_empty
 
-        self._cell_buf: List[np.ndarray] = []
+        self.bitpack = bitpack
+        self.binary_meta = binary_meta
+
+        self._cell_buf: List[np.ndarray] = []  # (8,8) arrays if not bitpack
+        self._cell_packed: List[int] = []  # uint64 ints if bitpack
         self._meta_buf: List[CellRecord] = []
         self._shard_index = 0
         self._global_cell_id = 0
@@ -336,7 +374,10 @@ class ShardedCellWriter:
         for cell, meta in zip(cells, metas):
             meta.cell_id = self._global_cell_id
             self._global_cell_id += 1
-            self._cell_buf.append(cell)
+            if self.bitpack:
+                self._cell_packed.append(int(bitpack_cell(cell)))
+            else:
+                self._cell_buf.append(cell)
             self._meta_buf.append(meta)
             if self.shard_size and len(self._cell_buf) >= self.shard_size:
                 self._flush_current_shard()
@@ -354,10 +395,94 @@ class ShardedCellWriter:
             return
         if self.shard_size is None:
             # Single output file case
-            cells_arr = np.stack(self._cell_buf, axis=0).astype(np.uint8)
-            out_cells = self.out_dir / "cells.npy"
+            if self.bitpack:
+                cells_arr = np.array(self._cell_packed, dtype=np.uint64)
+                out_cells = self.out_dir / "cells_bitpack.npy"
+            else:
+                cells_arr = np.stack(self._cell_buf, axis=0).astype(np.uint8)
+                out_cells = self.out_dir / "cells.npy"
             np.save(out_cells, cells_arr)
-            out_meta = self.out_dir / "cells_meta.jsonl"
+
+            if self.binary_meta:
+                meta_dtype = np.dtype(
+                    [
+                        ("cell_id", "<i8"),
+                        ("glyph_id", "<i8"),
+                        ("row", "<i2"),
+                        ("col", "<i2"),
+                        ("empty", "u1"),
+                    ]
+                )
+                meta_arr = np.zeros(len(self._meta_buf), dtype=meta_dtype)
+                for i, m in enumerate(self._meta_buf):
+                    meta_arr[i] = (
+                        m.cell_id,
+                        m.glyph_id,
+                        m.row,
+                        m.col,
+                        1 if m.empty else 0,
+                    )
+                out_meta = self.out_dir / (
+                    "cells_meta_bin.npy"
+                    if not self.bitpack
+                    else "cells_meta_bitpack_bin.npy"
+                )
+                np.save(out_meta, meta_arr)
+            else:
+                out_meta = self.out_dir / (
+                    "cells_meta.jsonl"
+                    if not self.bitpack
+                    else "cells_meta_bitpack.jsonl"
+                )
+                with open(out_meta, "w", encoding="utf-8") as f:
+                    for m in self._meta_buf:
+                        f.write(
+                            json.dumps(
+                                {
+                                    "cell_id": m.cell_id,
+                                    "glyph_id": m.glyph_id,
+                                    "row": m.row,
+                                    "col": m.col,
+                                    "empty": m.empty,
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        )
+            print(f"[INFO] Wrote consolidated cells: {cells_arr.shape} -> {out_cells}")
+            print(f"[INFO] Wrote metadata: {out_meta}")
+            # Clear buffers (should only happen once)
+            self._cell_buf.clear()
+            self._cell_packed.clear()
+            self._meta_buf.clear()
+            return
+
+        # Sharded
+        shard_id = self._shard_index
+        self._shard_index += 1
+        if self.bitpack:
+            cells_arr = np.array(self._cell_packed, dtype=np.uint64)
+            out_cells = self.out_dir / f"cells_bitpack_shard_{shard_id:03d}.npy"
+        else:
+            cells_arr = np.stack(self._cell_buf, axis=0).astype(np.uint8)
+            out_cells = self.out_dir / f"cells_shard_{shard_id:03d}.npy"
+        if self.binary_meta:
+            meta_dtype = np.dtype(
+                [
+                    ("cell_id", "<i8"),
+                    ("glyph_id", "<i8"),
+                    ("row", "<i2"),
+                    ("col", "<i2"),
+                    ("empty", "u1"),
+                ]
+            )
+            meta_arr = np.zeros(len(self._meta_buf), dtype=meta_dtype)
+            for i, m in enumerate(self._meta_buf):
+                meta_arr[i] = (m.cell_id, m.glyph_id, m.row, m.col, 1 if m.empty else 0)
+            out_meta = self.out_dir / f"meta_bin_shard_{shard_id:03d}.npy"
+            np.save(out_meta, meta_arr)
+        else:
+            out_meta = self.out_dir / f"meta_shard_{shard_id:03d}.jsonl"
             with open(out_meta, "w", encoding="utf-8") as f:
                 for m in self._meta_buf:
                     f.write(
@@ -373,39 +498,11 @@ class ShardedCellWriter:
                         )
                         + "\n"
                     )
-            print(f"[INFO] Wrote consolidated cells: {cells_arr.shape} -> {out_cells}")
-            print(f"[INFO] Wrote metadata: {out_meta}")
-            # Clear buffers (should only happen once)
-            self._cell_buf.clear()
-            self._meta_buf.clear()
-            return
-
-        # Sharded
-        shard_id = self._shard_index
-        self._shard_index += 1
-        cells_arr = np.stack(self._cell_buf, axis=0).astype(np.uint8)
-        out_cells = self.out_dir / f"cells_shard_{shard_id:03d}.npy"
-        out_meta = self.out_dir / f"meta_shard_{shard_id:03d}.jsonl"
-        np.save(out_cells, cells_arr)
-        with open(out_meta, "w", encoding="utf-8") as f:
-            for m in self._meta_buf:
-                f.write(
-                    json.dumps(
-                        {
-                            "cell_id": m.cell_id,
-                            "glyph_id": m.glyph_id,
-                            "row": m.row,
-                            "col": m.col,
-                            "empty": m.empty,
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                )
         print(
             f"[INFO] Wrote shard {shard_id}: cells {cells_arr.shape}, meta {len(self._meta_buf)} -> {out_cells}"
         )
         self._cell_buf.clear()
+        self._cell_packed.clear()
         self._meta_buf.clear()
 
         if final:
@@ -425,6 +522,8 @@ def consolidate_cells(
     kmeans_sample_size: int,
     kmeans_sample_out: Optional[Path],
     progress_every: int,
+    bitpack: bool,
+    binary_meta: bool,
 ):
     random.seed(cfg.seed)
     np.random.seed(cfg.seed)
@@ -440,7 +539,11 @@ def consolidate_cells(
         sys.exit(1)
 
     writer = ShardedCellWriter(
-        out_dir=out_dir, shard_size=shard_size, include_empty=include_empty
+        out_dir=out_dir,
+        shard_size=shard_size,
+        include_empty=include_empty,
+        bitpack=bitpack,
+        binary_meta=binary_meta,
     )
 
     sampler = (
@@ -570,6 +673,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--seed", type=int, default=None, help="Override seed (else use config seed)."
     )
+    p.add_argument(
+        "--bitpack",
+        action="store_true",
+        help="Store each 8x8 cell as a uint64 bitmask (8x space reduction).",
+    )
+    p.add_argument(
+        "--binary-meta",
+        action="store_true",
+        help="Write metadata as a binary structured .npy instead of JSONL.",
+    )
     return p
 
 
@@ -598,6 +711,8 @@ def main(argv: Optional[Sequence[str]] = None):
         kmeans_sample_size=args.kmeans_sample_size,
         kmeans_sample_out=kmeans_sample_out,
         progress_every=args.progress_every,
+        bitpack=args.bitpack,
+        binary_meta=args.binary_meta,
     )
 
 
