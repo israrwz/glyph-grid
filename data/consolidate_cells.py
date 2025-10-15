@@ -524,6 +524,12 @@ def consolidate_cells(
     progress_every: int,
     bitpack: bool,
     binary_meta: bool,
+    make_splits: bool = False,
+    train_ratio: float = 0.8,
+    val_ratio: float = 0.1,
+    test_ratio: float = 0.1,
+    split_seed: int = 42,
+    metadata_path: Optional[Path] = None,
 ):
     random.seed(cfg.seed)
     np.random.seed(cfg.seed)
@@ -545,6 +551,47 @@ def consolidate_cells(
         bitpack=bitpack,
         binary_meta=binary_meta,
     )
+
+    # -------- Split preparation --------
+    font_map: Dict[int, str] = {}
+    if make_splits:
+        if metadata_path is None or not metadata_path.exists():
+            print(
+                "[WARN] --make-splits requested but metadata_path missing; disabling splits.",
+                file=sys.stderr,
+            )
+            make_splits = False
+        else:
+            # Build glyph_id -> font_hash map (glyph_id here is DB primary key used in metadata)
+            with metadata_path.open("r", encoding="utf-8") as mf:
+                for line in mf:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    gid = rec.get("glyph_id")
+                    fh = rec.get("font_hash")
+                    if gid is None or fh is None:
+                        continue
+                    try:
+                        gid_int = int(gid)
+                    except Exception:
+                        continue
+                    font_map[gid_int] = str(fh)
+            if not font_map:
+                print(
+                    "[WARN] No glyph->font_hash mappings found in metadata; disabling splits.",
+                    file=sys.stderr,
+                )
+                make_splits = False
+
+    # Containers for split assignment (store cell_ids)
+    split_assign: Dict[str, List[int]] = {"train": [], "val": [], "test": []}
+    font_split_lookup: Dict[str, str] = {}
+    rng = random.Random(split_seed)
 
     sampler = (
         ReservoirSampler(capacity=kmeans_sample_size, seed=cfg.seed)
@@ -577,6 +624,28 @@ def consolidate_cells(
 
         # Add to writer
         writer.add_batch(cells, meta)
+
+        # Split logic: assign after cells receive cell_ids
+        if make_splits:
+            fh = font_map.get(glyph_id)
+            if fh is not None:
+                # Lazy build font_split_lookup
+                if fh not in font_split_lookup:
+                    # Decide split deterministically via hashing + ratios
+                    # Hash-based stable assignment so order independent
+                    h = abs(hash((fh, split_seed))) / (
+                        2**63 if sys.maxsize > 2**32 else 2**31
+                    )
+                    cumulative = train_ratio
+                    if h < cumulative:
+                        font_split_lookup[fh] = "train"
+                    elif h < cumulative + val_ratio:
+                        font_split_lookup[fh] = "val"
+                    else:
+                        font_split_lookup[fh] = "test"
+                split_label = font_split_lookup[fh]
+                for m in meta:
+                    split_assign[split_label].append(m.cell_id)
 
         # Feed sampler with non-empty cells only
         if sampler:
@@ -626,6 +695,17 @@ def consolidate_cells(
             f"K-Means sample: {sampler.size} / {sampler.capacity} (non-empty only, from {sampler.seen} candidates)"
         )
     print("===========================================")
+    if make_splits:
+        # Shuffle cell ids within each split for downstream randomness
+        for split_label, ids in split_assign.items():
+            rng.shuffle(ids)
+            out_path = out_dir / f"phase1_{split_label}_cells.txt"
+            with out_path.open("w", encoding="utf-8") as f:
+                for cid in ids:
+                    f.write(f"{cid}\n")
+            print(
+                f"[SPLITS] Wrote {len(ids):,} cell_ids to {out_path.name} (split={split_label})"
+            )
 
 
 # --------------------------------------------------------------------------------------
@@ -673,6 +753,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--seed", type=int, default=None, help="Override seed (else use config seed)."
     )
+    # Splits
+    p.add_argument(
+        "--make-splits",
+        action="store_true",
+        help="Generate train/val/test cell_id split files (requires metadata in config).",
+    )
+    p.add_argument("--train-ratio", type=float, default=0.8)
+    p.add_argument("--val-ratio", type=float, default=0.1)
+    p.add_argument("--test-ratio", type=float, default=0.1)
+    p.add_argument(
+        "--split-seed",
+        type=int,
+        default=42,
+        help="Seed for split hashing / shuffling.",
+    )
     p.add_argument(
         "--bitpack",
         action="store_true",
@@ -713,6 +808,14 @@ def main(argv: Optional[Sequence[str]] = None):
         progress_every=args.progress_every,
         bitpack=args.bitpack,
         binary_meta=args.binary_meta,
+        make_splits=args.make_splits,
+        train_ratio=args.train_ratio,
+        val_ratio=args.val_ratio,
+        test_ratio=args.test_ratio,
+        split_seed=args.split_seed,
+        metadata_path=cfg.paths.grids_dir.parent / "rasters" / "metadata.jsonl"
+        if (cfg.paths.grids_dir.parent / "rasters" / "metadata.jsonl").exists()
+        else None,
     )
 
 
