@@ -449,6 +449,8 @@ class PrimitiveCellDataset(Dataset):
             for sp in sorted(root.glob("cells_bitpack_shard_*.npy")):
                 arr = np.load(sp, mmap_mode="r")  # uint64 vector
                 length = len(arr)
+                # We add a 'decoded' field (None initially). On first access we will
+                # vector-decode the entire shard into uint8 (N,8,8) and cache it.
                 self._shard_index.append(
                     {
                         "start": cumulative,
@@ -456,6 +458,7 @@ class PrimitiveCellDataset(Dataset):
                         "path": sp,
                         "array": arr,
                         "bitpack": True,
+                        "decoded": None,  # lazy full-shard decode cache
                     }
                 )
                 cumulative += length
@@ -492,8 +495,21 @@ class PrimitiveCellDataset(Dataset):
                     arr = entry["array"]
                     cell = arr[local_offset]
                     if entry.get("bitpack"):
-                        # cell is a uint64 mask
-                        return self._unpack_bitcell(int(cell))
+                        # Full-shard lazy decode path:
+                        # If not yet decoded, vectorize unpack of all uint64 masks in shard.
+                        if entry.get("decoded") is None:
+                            raw_vec = entry["array"]  # uint64 1D
+                            # View as bytes then unpack bits for all cells at once
+                            bytes_view = raw_vec.view(np.uint8).reshape(
+                                -1, 8
+                            )  # (N,8 bytes)
+                            bits = np.unpackbits(bytes_view, axis=1)  # (N,64)
+                            decoded = (bits.reshape(-1, 8, 8) * 255).astype(
+                                np.uint8
+                            )  # (N,8,8)
+                            entry["decoded"] = decoded
+                        decoded_arr = entry["decoded"]
+                        return decoded_arr[local_offset]
                     return cell if getattr(cell, "ndim", 2) == 2 else cell[0]
             raise KeyError(f"Cell id {cid} beyond shard ranges.")
 

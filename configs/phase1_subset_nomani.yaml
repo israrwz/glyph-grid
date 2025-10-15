@@ -33,7 +33,7 @@ benchmark: false
 # ------------------------------------------------------------------
 data:
   cells_dir: data/processed/cells_bitpack
-  assignments_file: data/processed/cells_bitpack_subset80k_nomani/primitive_assignments_subset.parquet
+  assignments_file: data/processed/cells_bitpack_subset80k_nomani/primitive_assignments_dense_uint16.npy
   shards_glob: null
   cell_size: 8
   channels: 1
@@ -41,7 +41,7 @@ data:
   val_split: data/processed/cells_bitpack_subset80k_nomani/phase1_val_cells.txt
   test_split: data/processed/cells_bitpack_subset80k_nomani/phase1_test_cells.txt
   empty_class_id: 0
-  empty_sampling_ratio: 0.1   # Downsample empties in TRAIN only
+  empty_sampling_ratio: 0.05 # More aggressive empty downsampling for speed
 
 # ------------------------------------------------------------------
 # Vocabulary
@@ -57,8 +57,8 @@ vocabulary:
 # Data Loader
 # ------------------------------------------------------------------
 loader:
-  batch_size: 1024
-  num_workers: 8
+  batch_size: 4096
+  num_workers: 12
   pin_memory: true
   shuffle: true
   drop_last: false
@@ -109,7 +109,7 @@ scheduler:
 # Training Loop
 # ------------------------------------------------------------------
 training:
-  epochs: 40            # Slightly fewer for subset iteration
+  epochs: 40 # Slightly fewer for subset iteration
   early_stop:
     patience: 6
     min_delta: 0.0005
@@ -172,7 +172,7 @@ logging:
 # Misclassified Rendering
 # ------------------------------------------------------------------
 misclassified_render:
-  enabled: true
+  enabled: false
   output_dir: logs/phase1_subset80k_nomani_misclassified
   max_samples_per_epoch: 40
   layout: horizontal
@@ -187,8 +187,8 @@ misclassified_render:
 # Evaluation / Export
 # ------------------------------------------------------------------
 eval:
-  batch_size: 1024
-  num_workers: 8
+  batch_size: 4096
+  num_workers: 12
   export_embeddings: true
   embeddings_path: artifacts/phase1_subset80k_nomani_cell_embeddings.npy
   confusion_matrix: true
@@ -196,7 +196,7 @@ eval:
 
 export:
   onnx: { enabled: true, path: artifacts/phase1_subset80k_nomani_model.onnx, opset: 18 }
-  jit:  { enabled: true, path: artifacts/phase1_subset80k_nomani_model_jit.pt }
+  jit: { enabled: true, path: artifacts/phase1_subset80k_nomani_model_jit.pt }
   centroids:
     recompute_from_assignments: false
     path: assets/centroids/primitive_centroids.npy
@@ -217,7 +217,6 @@ sanity:
   verify_cell_size: 8
   verify_class_range: true
   min_samples_per_nonempty: 5
-
 # ------------------------------------------------------------------
 # Notes
 # ------------------------------------------------------------------
