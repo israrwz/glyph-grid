@@ -891,12 +891,45 @@ def train_phase1(cfg: TrainConfig) -> None:
         print(
             f"[DATA] Using consolidated mmap dataset at {consolidated_dir}", flush=True
         )
-        cells_uint8 = np.load(
-            consolidated_dir / "cells_uint8.npy", mmap_mode="r"
-        )  # (N,8,8) uint8
-        labels_arr = np.load(
-            consolidated_dir / "labels_uint16.npy", mmap_mode="r"
-        )  # (N,) uint16 (65535=missing)
+        # Robust loading with fallback: if the files are raw contiguous dumps (no NPY header)
+        # we reconstruct shapes manually.
+        try:
+            cells_uint8 = np.load(
+                consolidated_dir / "cells_uint8.npy", mmap_mode="r"
+            )  # (N,8,8) uint8
+        except Exception as e:
+            raw_path = consolidated_dir / "cells_uint8.npy"
+            sz = raw_path.stat().st_size
+            if sz % 64 != 0:
+                raise RuntimeError(
+                    f"Failed np.load on {raw_path} and size {sz} not divisible by 64 (cannot raw-map). Original error: {e}"
+                )
+            n = sz // 64
+            print(
+                f"[warn] Falling back to raw memmap for cells_uint8.npy (no valid .npy header, inferring N={n})",
+                flush=True,
+            )
+            cells_uint8 = np.memmap(
+                raw_path, dtype=np.uint8, mode="r", shape=(n, 64)
+            ).reshape(n, 8, 8)
+
+        try:
+            labels_arr = np.load(
+                consolidated_dir / "labels_uint16.npy", mmap_mode="r"
+            )  # (N,) uint16
+        except Exception as e:
+            raw_lab = consolidated_dir / "labels_uint16.npy"
+            sz_lab = raw_lab.stat().st_size
+            if sz_lab % 2 != 0:
+                raise RuntimeError(
+                    f"Failed np.load on {raw_lab} and size {sz_lab} not divisible by 2 (cannot raw-map). Original error: {e}"
+                )
+            n_lab = sz_lab // 2
+            print(
+                f"[warn] Falling back to raw memmap for labels_uint16.npy (no valid .npy header, inferring N={n_lab})",
+                flush=True,
+            )
+            labels_arr = np.memmap(raw_lab, dtype=np.uint16, mode="r", shape=(n_lab,))
 
         def _build_index(split_path: Path | None, empty_sampling_ratio: float):
             ids = []
