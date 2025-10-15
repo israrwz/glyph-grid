@@ -1212,6 +1212,79 @@ def write_metadata_line(
 # ---------------------------------------------------------------------------
 
 
+def _raster_worker(args):
+    """
+    Top-level multiprocessing worker (picklable) to avoid local function pickle error.
+    Args:
+        args: (row_dict, cfg)
+    Returns:
+        (processed_count, skipped_empty_count, skipped_outlier_count)
+    """
+    row, cfg = args
+    import re, json
+
+    try:
+        orig_glyph_id = row["glyph_id"]
+        db_id = row["id"]
+        label = row["label"]
+        contours_json = row.get("contours_json")
+        used_ascent = row.get("used_ascent")
+        used_descent = row.get("used_descent")
+        font_hash = row.get("font_hash", "")
+        char_class = row.get("char_class", "")
+        advance_width = row.get("advance_width")
+
+        subpaths = parse_contours(contours_json)
+        if not subpaths:
+            return (0, 1, 0)
+
+        # Outlier filtering (large diacritic exclusion)
+        bounds_str = row.get("bounds")
+        try:
+            if bounds_str:
+                bounds = json.loads(bounds_str)
+                if bounds and len(bounds) == 4:
+                    min_x, min_y, max_x, max_y = bounds
+                    bbox_w = max_x - min_x
+                    bbox_h = max_y - min_y
+                    major_dim = max(bbox_w, bbox_h)
+                    em_height = (
+                        (used_ascent - used_descent)
+                        if (used_ascent and used_descent)
+                        else bbox_h
+                    )
+                    em_height = em_height if em_height != 0 else 1.0
+                    ratio = major_dim / em_height
+                    adv = advance_width if advance_width is not None else 1000
+                    is_diacritic_by_class = (
+                        "diacritic" in char_class.lower() if char_class else False
+                    )
+                    if is_diacritic_by_class and (adv >= 100 and ratio >= 0.15):
+                        return (0, 0, 1)
+        except Exception:
+            pass
+
+        bitmap, meta = rasterize_glyph(
+            subpaths, used_ascent, used_descent, cfg, advance_width=advance_width
+        )
+        meta["orig_glyph_id"] = orig_glyph_id
+
+        safe_label = re.sub(r"[^A-Za-z0-9._-]+", "_", label)[:64]
+        raster_path = cfg.paths.rasters_dir / f"{safe_label}_{db_id}.png"
+        Image.fromarray(bitmap, mode="L").save(
+            raster_path,
+            optimize=True,
+            compress_level=cfg.raster.store_mode == "binary_uint8",
+        )
+        meta["raster_filename"] = raster_path.name
+        grid = extract_cell_grid(bitmap, cfg)
+        np.save(cfg.paths.grids_dir / f"{db_id}.npy", grid, allow_pickle=False)
+        write_metadata_line(cfg.paths.metadata_path, db_id, label, font_hash, meta)
+        return (1, 0, 0)
+    except Exception:
+        return (0, 0, 0)
+
+
 def run_rasterization(cfg: FullConfig, limit: int | None = None):
     """
     Rasterize glyphs with optional multiprocessing.
@@ -1421,7 +1494,8 @@ def run_rasterization(cfg: FullConfig, limit: int | None = None):
 
     with mp.Pool(processes=workers) as pool:
         for i, (p, se, so) in enumerate(
-            pool.imap_unordered(_worker, kept, chunksize=64), 1
+            pool.imap_unordered(_raster_worker, ((r, cfg) for r in kept), chunksize=64),
+            1,
         ):
             processed += p
             skipped_empty += se
