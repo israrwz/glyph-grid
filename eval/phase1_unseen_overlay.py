@@ -49,13 +49,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import random
 import sqlite3
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Optional, Sequence
 
 import numpy as np
 from PIL import Image

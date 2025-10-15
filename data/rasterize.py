@@ -94,9 +94,7 @@ This allows the pipeline to progress even when many glyphs currently have no vec
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import json
-import math
 import os
 import random
 import sqlite3
@@ -104,7 +102,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Sequence, Tuple
 
 try:
     import yaml
@@ -330,7 +328,7 @@ def build_label_whitelist(
         # Example suffixes (init/medi/final) - adapt as needed
         return label.endswith(("_init", "_medi", "_final"))
 
-    whitelist = {l for l, c in freq.items() if c >= min_count}
+    whitelist = {L for L, c in freq.items() if c >= min_count}
     return whitelist
 
 
@@ -471,7 +469,7 @@ def parse_contours(contours_json: str) -> List[List[Tuple[float, float]]]:
                     # Multiple points: implicit on-curve between consecutive off-curve controls
                     controls = pts[:-1]
                     final_on = pts[-1]
-                    expanded: List[Tuple[float, float]] = []
+                    # expanded: List[Tuple[float, float]] = []
                     # Walk pairs
                     prev = P0
                     for i in range(len(controls) - 1):
@@ -1221,7 +1219,8 @@ def _raster_worker(args):
         (processed_count, skipped_empty_count, skipped_outlier_count)
     """
     row, cfg = args
-    import re, json
+    import re
+    import json
 
     try:
         orig_glyph_id = row["glyph_id"]
@@ -1308,7 +1307,6 @@ def run_rasterization(cfg: FullConfig, limit: int | None = None):
     import re
     import multiprocessing as mp
 
-    rng = random.Random(cfg.seed)
     np.random.seed(cfg.seed)
 
     cfg.paths.rasters_dir.mkdir(parents=True, exist_ok=True)
@@ -1483,7 +1481,7 @@ def run_rasterization(cfg: FullConfig, limit: int | None = None):
             np.save(cfg.paths.grids_dir / f"{db_id}.npy", grid, allow_pickle=False)
             write_metadata_line(cfg.paths.metadata_path, db_id, label, font_hash, meta)
             return (1, 0, 0)
-        except Exception as e:
+        except Exception as _e:
             # Optional: could log traceback; keep silent for speed
             return (0, 0, 0)
 

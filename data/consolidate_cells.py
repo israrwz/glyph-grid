@@ -97,7 +97,6 @@ Author: Automated expert scaffold (extended with bitpacking & binary metadata op
 from __future__ import annotations
 
 # Global raster filename lookup (glyph_id -> raster_filename) populated once from metadata.
-RASTER_FILENAME_MAP: Dict[int, str] = {}
 
 import argparse
 import json
@@ -130,6 +129,7 @@ except ImportError:
     sys.exit(1)
 
 
+RASTER_FILENAME_MAP: Dict[int, str] = {}
 # --------------------------------------------------------------------------------------
 # Config Loading (minimal fields extracted from rasterizer.yaml)
 # --------------------------------------------------------------------------------------

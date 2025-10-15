@@ -60,7 +60,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 import functools
 
 # ---------------------------------------------------------------------------
@@ -602,7 +602,6 @@ def build_scheduler(
     if strat == "cosine":
         warmup_epochs = int(sched_cfg.get("warmup_epochs", 0))
         min_lr_scale = float(sched_cfg.get("min_lr_scale", 0.1))
-        base_lrs = [group["lr"] for group in optimizer.param_groups]
 
         def lr_lambda(epoch: int):
             if epoch < warmup_epochs and warmup_epochs > 0:

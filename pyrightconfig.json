@@ -1,0 +1,3 @@
+{
+  "ignore": ["eval", "data", "train"]
+}
