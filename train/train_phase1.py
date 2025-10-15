@@ -406,14 +406,15 @@ class PrimitiveCellDataset(Dataset):
         if cell.ndim != 2 or cell.shape != (8, 8):
             raise ValueError(f"Unexpected cell shape for id {cid}: {cell.shape}")
 
-        tensor = torch.from_numpy((cell > 0).astype("float32")).unsqueeze(0)  # (1,8,8)
+        # Defer conversion to torch tensor to batch-level collate for speed.
+        import numpy as np
 
+        arr = cell  # either np.ndarray (8,8) or will be decoded later by collate
         if self.transform:
-            tensor = self.transform(tensor)
-
+            arr = self.transform(arr)
         if self.return_cell_id:
-            return tensor, label, cid
-        return tensor, label
+            return arr, label, cid
+        return arr, label
 
     # ---------------------------------------------
     def _build_shard_index_if_needed(self):
@@ -932,6 +933,38 @@ def train_phase1(cfg: TrainConfig) -> None:
         )
         num_workers = recommended_workers
 
+    # Custom collate: batch decode bitpacked masks to tensors
+    def _batch_decode_collate(batch):
+        import numpy as np, torch
+
+        cells_raw = []
+        labels = []
+        cell_ids = []
+        first_cell = batch[0][0]
+        is_array = hasattr(first_cell, "shape") and getattr(
+            first_cell, "shape", None
+        ) == (8, 8)
+        for item in batch:
+            if len(item) == 3:
+                cell, lbl, cid = item
+            else:
+                cell, lbl = item
+                cid = -1
+            labels.append(int(lbl))
+            cell_ids.append(int(cid))
+            cells_raw.append(cell)
+        if is_array:
+            arr = np.stack(cells_raw, axis=0).astype(np.uint8)
+        else:
+            raw_masks = np.asarray(cells_raw, dtype=np.uint64)
+            bytes_view = raw_masks.view(np.uint8).reshape(-1, 8)
+            bits = np.unpackbits(bytes_view, axis=1)  # (N,64)
+            arr = bits.reshape(-1, 8, 8).astype(np.uint8)
+        tensor = torch.from_numpy((arr > 0).astype("float32")).unsqueeze(1)  # (N,1,8,8)
+        labels_t = torch.as_tensor(labels, dtype=torch.long)
+        cell_ids_t = torch.as_tensor(cell_ids, dtype=torch.int64)
+        return tensor, labels_t, cell_ids_t
+
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
@@ -941,6 +974,7 @@ def train_phase1(cfg: TrainConfig) -> None:
         drop_last=False,
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
         persistent_workers=persistent_workers,
+        collate_fn=_batch_decode_collate,
     )
     val_loader = DataLoader(
         val_ds,
@@ -951,6 +985,7 @@ def train_phase1(cfg: TrainConfig) -> None:
         drop_last=False,
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
         persistent_workers=persistent_workers,
+        collate_fn=_batch_decode_collate,
     )
 
     # Model
