@@ -92,7 +92,10 @@ Sections utilized from NEW_PLAN.md:
   - §9.1 Preprocessing tasks (cell slicing & storage)
 
 Author: Automated expert scaffold (extended with bitpacking & binary metadata options)
-"""
+ """
+
+# Global raster filename lookup (glyph_id -> raster_filename) populated once from metadata.
+RASTER_FILENAME_MAP: Dict[int, str] = {}
 
 from __future__ import annotations
 
@@ -262,10 +265,26 @@ def extract_cells_from_glyph(
         )
         return [], [], 0, 0
 
-    raster_img_path = raster_path / f"{glyph_id}.png"
-    if not raster_img_path.exists():
+    # Optimized raster lookup:
+    # Prefer metadata-derived filename (stored during rasterization as sanitized_label_id.png).
+    raster_img_path: Optional[Path] = None
+    meta_fname = RASTER_FILENAME_MAP.get(glyph_id)
+    if meta_fname:
+        candidate = raster_path / meta_fname
+        if candidate.exists():
+            raster_img_path = candidate
+    if raster_img_path is None:
+        # Fallback: legacy <id>.png then pattern "*_<id>.png"
+        legacy = raster_path / f"{glyph_id}.png"
+        if legacy.exists():
+            raster_img_path = legacy
+        else:
+            candidates = sorted(raster_path.glob(f"*_{glyph_id}.png"))
+            if candidates:
+                raster_img_path = candidates[0]
+    if raster_img_path is None:
         print(
-            f"[WARN] Missing raster {raster_img_path}; skipping glyph {glyph_id}",
+            f"[WARN] Missing raster for glyph {glyph_id} (checked metadata, {glyph_id}.png and *_{glyph_id}.png); skipping.",
             file=sys.stderr,
         )
         return [], [], 0, 0
@@ -574,6 +593,7 @@ def consolidate_cells(
                         continue
                     gid = rec.get("glyph_id")
                     fh = rec.get("font_hash")
+                    raster_fname = rec.get("raster_filename")
                     if gid is None or fh is None:
                         continue
                     try:
@@ -581,6 +601,9 @@ def consolidate_cells(
                     except Exception:
                         continue
                     font_map[gid_int] = str(fh)
+                    if raster_fname:
+                        # Store first-seen filename (should be unique per glyph_id)
+                        RASTER_FILENAME_MAP.setdefault(gid_int, str(raster_fname))
             if not font_map:
                 print(
                     "[WARN] No glyph->font_hash mappings found in metadata; disabling splits.",
