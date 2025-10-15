@@ -398,11 +398,15 @@ class ShardedCellWriter:
             else:
                 self._cell_buf.append(cell)
             self._meta_buf.append(meta)
-            if self.shard_size and len(self._cell_buf) >= self.shard_size:
-                self._flush_current_shard()
+            if self.shard_size:
+                current_count = (
+                    len(self._cell_packed) if self.bitpack else len(self._cell_buf)
+                )
+                if current_count >= self.shard_size:
+                    self._flush_current_shard()
 
     def finalize(self):
-        if self._cell_buf:
+        if self._cell_buf or self._cell_packed:
             self._flush_current_shard(final=True)
 
     @property
@@ -410,7 +414,7 @@ class ShardedCellWriter:
         return self._global_cell_id
 
     def _flush_current_shard(self, final: bool = False):
-        if not self._cell_buf:
+        if (not self._cell_buf) and (not self._cell_packed):
             return
         if self.shard_size is None:
             # Single output file case
