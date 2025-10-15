@@ -1401,6 +1401,60 @@ def train_phase1(cfg: TrainConfig) -> None:
                 f"val_ips={val_stats.get('samples_per_sec', 0):.0f}",
                 flush=True,
             )
+            # ------------------------------------------------------------------
+            # Per‑epoch rolling 'last.pt' checkpoint + asynchronous unseen overlay
+            # ------------------------------------------------------------------
+            try:
+                last_path = ckpt_dir / "last.pt"
+                save_checkpoint(
+                    last_path,
+                    model,
+                    optimizer,
+                    epoch,
+                    {
+                        "val_accuracy_top1": val_stats.get("accuracy_top1"),
+                        "val_loss": val_stats.get("loss"),
+                    },
+                )
+                # Launch overlay script (non-blocking) using the freshly written last.pt
+                import subprocess, os
+
+                epoch_overlay_dir = Path(f"output/unseen_overlays_{epoch:03d}")
+                epoch_overlay_dir.mkdir(parents=True, exist_ok=True)
+                panel_path = epoch_overlay_dir / "panel.png"
+                overlay_cmd = [
+                    "python",
+                    "-m",
+                    "eval.phase1_unseen_overlay",
+                    "--db",
+                    "dataset/glyphs.db",
+                    "--raster-config",
+                    "configs/rasterizer.yaml",
+                    "--centroids",
+                    "assets/centroids/primitive_centroids.npy",
+                    "--checkpoint-file",
+                    str(last_path),
+                    "--out-dir",
+                    str(epoch_overlay_dir),
+                    "--panel-out",
+                    str(panel_path),
+                    "--sample",
+                    "20",
+                    "--alpha",
+                    "255",
+                    "--seed",
+                    "123",
+                ]
+                subprocess.Popen(
+                    overlay_cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception as _overlay_e:
+                print(
+                    f"[warn] Failed per-epoch overlay generation: {_overlay_e}",
+                    file=sys.stderr,
+                )
 
         # Monitor metric
         monitored_value = None
