@@ -148,11 +148,14 @@ class CellSource:
         shard_list = sorted(self.root.glob("shard_*.npy"))
         if shard_list:
             return "sharded_npy"
+        bitpack_list = sorted(self.root.glob("cells_bitpack_shard_*.npy"))
+        if bitpack_list:
+            return "bitpack_sharded"
         # Placeholder for LMDB or other formats
         if (self.root / "cells.lmdb").exists():
             return "lmdb"  # TODO: implement LMDB reading
         raise RuntimeError(
-            "Unable to detect cell storage format (expected cells.npy, shard_*.npy, or cells.lmdb)"
+            "Unable to detect cell storage format (expected cells.npy, shard_*.npy, cells_bitpack_shard_*.npy, or cells.lmdb)"
         )
 
     def iter_cells(self) -> Iterator[Tuple[int, np.ndarray]]:
@@ -181,6 +184,15 @@ class CellSource:
                         cell = cell[0]
                     yield offset + i, cell
                 offset += len(shard)
+        elif self._format == "bitpack_sharded":
+            # Bitpacked shards: uint64 array, one 64-bit mask per 8x8 cell.
+            shards = sorted(self.root.glob("cells_bitpack_shard_*.npy"))
+            offset = 0
+            for shard_path in shards:
+                masks = np.load(shard_path, mmap_mode="r")  # shape (N,)
+                for i in range(len(masks)):
+                    yield offset + i, unpack_bitcell(masks[i])
+                offset += len(masks)
         elif self._format == "lmdb":
             # TODO: Implement LMDB reading logic
             raise NotImplementedError("LMDB backend not yet implemented.")
@@ -196,6 +208,23 @@ class CellSource:
 # --------------------------------------------------------------------------------------
 # Sampling & Vectorization
 # --------------------------------------------------------------------------------------
+
+
+def unpack_bitcell(val: np.uint64) -> np.ndarray:
+    """
+    Unpack a uint64 bitmask into an (8,8) uint8 binary cell (0/255).
+    Bit (r*8 + c) corresponds to pixel (r,c).
+    """
+    bits = int(val)
+    out = np.zeros((8, 8), dtype=np.uint8)
+    # Iterate over set bits only for efficiency
+    while bits:
+        lsb = bits & -bits
+        idx = lsb.bit_length() - 1
+        r, c = divmod(idx, 8)
+        out[r, c] = 255
+        bits ^= lsb
+    return out
 
 
 def flatten_cell(cell: np.ndarray) -> np.ndarray:
@@ -568,6 +597,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     sc.add_argument("--cells-dir", required=True)
     sc.add_argument("--k", type=int, default=1023)
     sc.add_argument("--sample-size", type=int, default=1_000_000)
+    sc.add_argument(
+        "--sample-path",
+        type=str,
+        default="",
+        help="Optional precomputed sample .npy (overrides on-the-fly sampling & --sample-size).",
+    )
     sc.add_argument("--seed", type=int, default=42)
     sc.add_argument("--batch-size", type=int, default=10_000)
     sc.add_argument("--max-iter", type=int, default=200)
@@ -614,7 +649,41 @@ def cmd_sample_and_cluster(args: argparse.Namespace):
     )
 
     source = CellSource(Path(args.cells_dir))
-    vectors = sample_non_empty_cells(source, cfg.sample_size, cfg.seed)
+    if args.sample_path:
+        sample_path = Path(args.sample_path)
+        if not sample_path.exists():
+            raise FileNotFoundError(f"--sample-path file not found: {sample_path}")
+        vectors_raw = np.load(sample_path)
+        # Accept (N,8,8) or (N,64)
+        if vectors_raw.ndim == 3 and vectors_raw.shape[1:] == (8, 8):
+            vectors = (vectors_raw.reshape(vectors_raw.shape[0], -1) > 0).astype(
+                np.float32
+            )
+        elif vectors_raw.ndim == 2 and vectors_raw.shape[1] == 64:
+            vectors = vectors_raw.astype(np.float32)
+        else:
+            raise ValueError(
+                f"Unsupported sample array shape {vectors_raw.shape}; expected (N,8,8) or (N,64)."
+            )
+        print(
+            f"[sample] Loaded precomputed sample from {sample_path} shape={vectors.shape}",
+            file=sys.stderr,
+        )
+    else:
+        if cfg.sample_size <= 0:
+            # Sample size 0 => load ALL non-empty cells (streaming)
+            collected: List[np.ndarray] = []
+            for _cid, cell in source.iter_cells():
+                if CellSource.is_empty(cell):
+                    continue
+                collected.append(flatten_cell(cell))
+            vectors = np.stack(collected, axis=0)
+            print(
+                f"[sample] Loaded all non-empty cells: {vectors.shape[0]:,}",
+                file=sys.stderr,
+            )
+        else:
+            vectors = sample_non_empty_cells(source, cfg.sample_size, cfg.seed)
     centroids = run_kmeans(vectors, cfg)
     save_centroids_with_empty(centroids, Path(args.output_centroids))
 
