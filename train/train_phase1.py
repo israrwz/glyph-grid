@@ -373,12 +373,14 @@ class PrimitiveCellDataset(Dataset):
     def _unpack_bitcell(mask: int):
         """
         Vectorized unpack of a uint64 bitmask into (8,8) uint8 (0/255).
+        Corrected to little-endian bit order per byte (matching original iterative logic).
         Cached to avoid repeated reconstruction for common patterns (e.g., EMPTY).
         """
         import numpy as np
 
         b = np.frombuffer(np.uint64(mask).tobytes(), dtype=np.uint8)
-        bits = np.unpackbits(b)  # length 64
+        # Unpack MSB->LSB then reverse within each byte to get little-endian bit significance.
+        bits = np.unpackbits(b).reshape(-1, 8)[:, ::-1].reshape(-1)
         arr = (bits[:64].reshape(8, 8) * 255).astype(np.uint8)
         return arr
 
@@ -476,6 +478,8 @@ class PrimitiveCellDataset(Dataset):
                 if self._eager_decode_bitpack:
                     bytes_view = arr.view(np.uint8).reshape(-1, 8)
                     bits = np.unpackbits(bytes_view, axis=1)
+                    # Reverse bit order within each byte for little-endian orientation.
+                    bits = bits.reshape(-1, 8, 8)[:, :, ::-1].reshape(-1, 64)
                     decoded = (bits.reshape(-1, 8, 8) * 255).astype(np.uint8)
                     self._shard_index[-1]["decoded"] = decoded
                 cumulative += length
@@ -520,7 +524,9 @@ class PrimitiveCellDataset(Dataset):
                             bytes_view = raw_vec.view(np.uint8).reshape(
                                 -1, 8
                             )  # (N,8 bytes)
-                            bits = np.unpackbits(bytes_view, axis=1)  # (N,64)
+                            bits = np.unpackbits(bytes_view, axis=1)  # (N,64) MSB->LSB
+                            # Reverse bit order within each byte block to restore little-endian orientation
+                            bits = bits.reshape(-1, 8, 8)[:, :, ::-1].reshape(-1, 64)
                             decoded = (bits.reshape(-1, 8, 8) * 255).astype(
                                 np.uint8
                             )  # (N,8,8)
@@ -1045,6 +1051,8 @@ def train_phase1(cfg: TrainConfig) -> None:
                 raw_masks = np.asarray(cells_raw, dtype=np.uint64)
                 bytes_view = raw_masks.view(np.uint8).reshape(-1, 8)
                 bits = np.unpackbits(bytes_view, axis=1)
+                # Reverse bits within each byte (little-endian correction)
+                bits = bits.reshape(-1, 8, 8)[:, :, ::-1].reshape(-1, 64)
                 arr = bits.reshape(-1, 8, 8).astype(np.uint8)
             tensor = torch.from_numpy((arr > 0).astype("float32")).unsqueeze(1)
             labels_t = torch.as_tensor(labels, dtype=torch.long)

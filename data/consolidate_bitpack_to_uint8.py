@@ -121,12 +121,17 @@ def decode_bitpack_chunk(raw: np.ndarray) -> np.ndarray:
     """
     raw: uint64 vector length N
     Returns uint8 array (N,8,8) with values {0,255}
+    Orientation: little-endian bit significance per byte (bit 0 -> column 0),
+    matching original iterative unpack logic.
     """
     # View underlying bytes (little-endian); shape (N, 8 bytes)
     bytes_view = raw.view(np.uint8).reshape(-1, 8)
-    # Unpack bits: numpy.unpackbits returns bits MSB->LSB per byte
-    bits = np.unpackbits(bytes_view, axis=1)  # (N, 64)
-    decoded = (bits.reshape(-1, 8, 8) * 255).astype(np.uint8)
+    # Unpack bits MSB->LSB per byte, then reverse within each byte to get little-endian order
+    bits_msb = np.unpackbits(
+        bytes_view, axis=1
+    )  # (N,64) groups of 8 bits per original byte
+    bits_le = bits_msb.reshape(-1, 8, 8)[:, :, ::-1].reshape(-1, 64)
+    decoded = (bits_le.reshape(-1, 8, 8) * 255).astype(np.uint8)
     return decoded
 
 
