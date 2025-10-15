@@ -94,10 +94,10 @@ Sections utilized from NEW_PLAN.md:
 Author: Automated expert scaffold (extended with bitpacking & binary metadata options)
  """
 
+from __future__ import annotations
+
 # Global raster filename lookup (glyph_id -> raster_filename) populated once from metadata.
 RASTER_FILENAME_MAP: Dict[int, str] = {}
-
-from __future__ import annotations
 
 import argparse
 import json
