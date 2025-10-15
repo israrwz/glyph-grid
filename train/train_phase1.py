@@ -185,13 +185,17 @@ class PrimitiveCellDataset(Dataset):
     Dataset returning (cell_tensor, primitive_id).
 
     Data Sources:
-      - cells_dir: directory with cells.npy or shard_*.npy (identical format to CellSource)
+      - cells_dir: directory with:
+          * cells.npy                       (consolidated_npy)
+          * shard_*.npy                     (sharded_npy)
+          * cells_bitpack_shard_*.npy       (bitpack_sharded; each uint64 packs an 8x8 cell)
       - assignments_file: Parquet (.parquet) OR JSONL (.jsonl) OR CSV (.csv)
          Must provide at least: cell_id, primitive_id
       - Optional split_file: text file listing selected cell_ids (one per line)
 
     Cell Loading:
-      - Uses CellSource to stream cells on demand (kept open as memory map).
+      - Uses CellSource-like internal logic to mmap shards.
+      - Bitpacked shards are transparently unpacked on access.
       - Internal index maps dataset index -> cell_id -> primitive_id
     """
 
@@ -322,6 +326,25 @@ class PrimitiveCellDataset(Dataset):
         return mapping
 
     # ---------------------------------------------
+    @staticmethod
+    def _unpack_bitcell(mask: int):
+        """
+        Unpack a uint64 bitmask into an (8,8) uint8 binary cell (0/255).
+        Bit (r*8 + c) corresponds to pixel (r,c). Uses set-bit iteration.
+        """
+        import numpy as np
+
+        out = np.zeros((8, 8), dtype=np.uint8)
+        bits = int(mask)
+        while bits:
+            lsb = bits & -bits
+            idx = lsb.bit_length() - 1
+            r, c = divmod(idx, 8)
+            out[r, c] = 255
+            bits ^= lsb
+        return out
+
+    # ---------------------------------------------
     def __len__(self) -> int:
         return len(self._cell_ids)
 
@@ -361,13 +384,9 @@ class PrimitiveCellDataset(Dataset):
         For 'consolidated_npy':
             - Load mmap once, store in self._consolidated_array (no per-call np.load).
         For 'sharded_npy':
-            - Build list of dicts:
-                {
-                  "start": global_start_cell_id,
-                  "end": exclusive_end_cell_id,
-                  "path": Path,
-                  "array": None or mmap (lazy)
-                }
+            - Build list of dicts with raw (N,8,8) arrays.
+        For 'bitpack_sharded':
+            - Build list of dicts with uint64 arrays; mark entries as bitpacked for on-demand unpack.
         """
         if self._shard_index is not None or self._consolidated_array is not None:
             return
@@ -388,7 +407,24 @@ class PrimitiveCellDataset(Dataset):
                         "start": cumulative,
                         "end": cumulative + length,
                         "path": sp,
-                        "array": arr,  # keep mmap reference
+                        "array": arr,
+                        "bitpack": False,
+                    }
+                )
+                cumulative += length
+        elif fmt == "bitpack_sharded":
+            self._shard_index = []
+            cumulative = 0
+            for sp in sorted(root.glob("cells_bitpack_shard_*.npy")):
+                arr = np.load(sp, mmap_mode="r")  # uint64 vector
+                length = len(arr)
+                self._shard_index.append(
+                    {
+                        "start": cumulative,
+                        "end": cumulative + length,
+                        "path": sp,
+                        "array": arr,
+                        "bitpack": True,
                     }
                 )
                 cumulative += length
@@ -410,8 +446,7 @@ class PrimitiveCellDataset(Dataset):
             cell = arr[cid]
             return cell if cell.ndim == 2 else cell[0]
 
-        if fmt == "sharded_npy":
-            # Binary search over shard index (list is small; linear acceptable but we do bisect)
+        if fmt in ("sharded_npy", "bitpack_sharded"):
             index = self._shard_index
             lo, hi = 0, len(index) - 1
             while lo <= hi:
@@ -425,7 +460,10 @@ class PrimitiveCellDataset(Dataset):
                     local_offset = cid - entry["start"]
                     arr = entry["array"]
                     cell = arr[local_offset]
-                    return cell if cell.ndim == 2 else cell[0]
+                    if entry.get("bitpack"):
+                        # cell is a uint64 mask
+                        return self._unpack_bitcell(int(cell))
+                    return cell if getattr(cell, "ndim", 2) == 2 else cell[0]
             raise KeyError(f"Cell id {cid} beyond shard ranges.")
 
         raise NotImplementedError("LMDB / other formats not implemented here.")

@@ -31,7 +31,7 @@ benchmark: false
 data:
   # Directory containing cell tensors extracted from glyph rasters.
   # Each record: (cell_id, glyph_id, row, col, primitive_label(optional init))
-  cells_dir: data/processed/cells
+  cells_dir: data/processed/cells_bitpack
   # File mapping cell_id -> primitive_id (produced after K-Means assignment).
   assignments_file: data/processed/primitive_assignments.parquet
   # Optional: shard pattern (if using multiple parquet / lmdb shards).
@@ -40,9 +40,9 @@ data:
   cell_size: 8
   channels: 1
   # Splits (lists of cell_ids) produced deterministically from font splits.
-  train_split: data/processed/cells/phase1_train_cells.txt
-  val_split: data/processed/cells/phase1_val_cells.txt
-  test_split: data/processed/cells/phase1_test_cells.txt
+  train_split: data/processed/cells_bitpack/phase1_train_cells.txt
+  val_split: data/processed/cells_bitpack/phase1_val_cells.txt
+  test_split: data/processed/cells_bitpack/phase1_test_cells.txt
   # Class 0 reserved for empty cell (all zeros).
   empty_class_id: 0
   # Downsampling ratio for empty cells in TRAIN split only (0,1]; validation/test keep all empties.
@@ -64,7 +64,7 @@ vocabulary:
 # ------------------------------------------------------------------
 loader:
   batch_size: 1024 # Plan specifies 1024
-  num_workers: 8
+  num_workers: 2
   pin_memory: true
   shuffle: true
   drop_last: false
