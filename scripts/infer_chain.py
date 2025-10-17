@@ -311,9 +311,14 @@ def raster_to_primitive_grid(
     img_path: Path,
     phase1_model: nn.Module,
     normalize_uint8: bool = True,
+    empty_threshold: float = 0.0,
 ) -> torch.Tensor:
     """
     Converts a 128x128 raster to a (16,16) primitive ID grid using Phase 1 model.
+
+    Empty cell masking:
+      Any 8x8 patch whose raw pixel max == 0 (fully empty) OR whose normalized
+      sum <= empty_threshold (default 0.0) is forced to primitive ID 0 after prediction.
 
     Returns:
       Tensor (16,16) int64 of primitive IDs.
@@ -324,14 +329,24 @@ def raster_to_primitive_grid(
         raise ValueError(f"Expected 128x128 image; got {arr.shape} for {img_path.name}")
 
     patches: List[torch.Tensor] = []
+    empties: List[bool] = []
     for gy in range(16):
         for gx in range(16):
-            patch = arr[gy * 8 : (gy + 1) * 8, gx * 8 : (gx + 1) * 8]
-            t = torch.from_numpy(patch)  # (8,8)
+            patch_raw = arr[gy * 8 : (gy + 1) * 8, gx * 8 : (gx + 1) * 8]
+            is_empty = patch_raw.max() == 0
+            t = torch.from_numpy(patch_raw)  # (8,8)
             if normalize_uint8 and t.max() > 1:
                 t = (t.float() / 255.0).to(torch.float32)
             else:
                 t = t.to(torch.float32)
+            # Optional secondary emptiness check after normalization
+            if (
+                not is_empty
+                and empty_threshold > 0.0
+                and t.sum().item() <= empty_threshold
+            ):
+                is_empty = True
+            empties.append(is_empty)
             t = t.unsqueeze(0).unsqueeze(0)  # (1,1,8,8)
             patches.append(t)
     batch = torch.cat(patches, dim=0).to(DEVICE)  # (256,1,8,8)
@@ -339,6 +354,10 @@ def raster_to_primitive_grid(
     with torch.no_grad():
         logits = phase1_model(batch)  # (256, num_primitives)
         preds = torch.argmax(logits, dim=1).view(16, 16).cpu()
+
+    # Apply empty cell masking: force primitive ID 0 for empty patches
+    empty_mask = torch.tensor(empties, dtype=torch.bool).view(16, 16)
+    preds[empty_mask] = 0
 
     return preds.to(torch.int64)
 

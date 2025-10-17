@@ -9,6 +9,17 @@ Purpose:
   without needing the original YAML config. This helps reconcile
   inference-time mismatches (e.g., missing keys in infer_chain.py).
 
+Additions (key dump & stats):
+  - Optional full key dump (--dump-keys) and shape summary.
+  - Optional parameter count breakdown (--param-stats).
+  - Optional JSONL raw key export (--keys-jsonl).
+  - Can save an inferred minimal reconstruction config (--emit-config).
+
+Empty Cell Masking Note:
+  This script only inspects checkpoints; masking logic for empty cells
+  should be applied in inference: set primitive ID=0 for any 8x8 patch
+  whose pixel sum == 0 (fully empty). See infer_chain adjustment.
+
 What it does:
   1. Loads a PyTorch checkpoint (Path to .pt).
   2. Extracts the underlying state_dict (handles payload["model_state"]).
@@ -22,11 +33,14 @@ What it does:
      - Transformer: d_model, mlp_hidden_dim, num_layers, inferred heads (best-effort),
        classifier hidden dim (if present).
   5. Prints a human-readable summary and optionally writes JSON output.
+  6. (New) Can dump raw parameter keys & shapes for deeper debugging.
 
 Usage:
   python scripts/inspect_phase2_ckpt.py --ckpt checkpoints/phase2/best.pt
   python scripts/inspect_phase2_ckpt.py --ckpt some.pt --json_out structure.json
   python scripts/inspect_phase2_ckpt.py --ckpt some.pt --verbose
+  python scripts/inspect_phase2_ckpt.py --ckpt last.pt --dump-keys
+  python scripts/inspect_phase2_ckpt.py --ckpt last.pt --param-stats --emit-config inferred_phase2_config.json
 
 Return codes:
   0 on success, non-zero on fatal errors (e.g., file missing / torch absent).
@@ -453,6 +467,34 @@ def parse_args():
     ap.add_argument(
         "--verbose", action="store_true", help="Print human-readable summary."
     )
+    ap.add_argument(
+        "--dump-keys",
+        action="store_true",
+        help="Print all parameter keys and shapes (can be large).",
+    )
+    ap.add_argument(
+        "--param-stats",
+        action="store_true",
+        help="Print parameter count per top-level module prefix.",
+    )
+    ap.add_argument(
+        "--keys-jsonl",
+        type=Path,
+        default=None,
+        help="Write raw key metadata (name, shape, dtype) as JSONL.",
+    )
+    ap.add_argument(
+        "--emit-config",
+        type=Path,
+        default=None,
+        help="Emit inferred minimal reconstruction config (JSON).",
+    )
+    ap.add_argument(
+        "--limit-keys",
+        type=int,
+        default=0,
+        help="Limit key print/dump (0=all).",
+    )
     return ap.parse_args()
 
 
@@ -467,6 +509,117 @@ def main():
     except Exception as e:
         print(f"[error] Failed to inspect checkpoint: {e}", file=sys.stderr)
         sys.exit(3)
+
+    # Raw state for additional dumps
+    payload = torch.load(str(args.ckpt), map_location="cpu")
+    state = (
+        payload.get("model_state")
+        if isinstance(payload, dict) and "model_state" in payload
+        else payload
+    )
+    keys = list(state.keys())
+
+    # Key dump
+    if args.dump_keys:
+        limit = args.limit_keys or len(keys)
+        print("=== Key Dump ===")
+        for k in keys[:limit]:
+            t = state[k]
+            print(f"{k:70s} {list(t.shape)} {t.dtype}")
+        print(f"[info] Printed {min(limit, len(keys))}/{len(keys)} keys.")
+
+    # Parameter stats
+    if args.param_stats:
+        prefix_counts = {}
+        for k, v in state.items():
+            # Extract top-level prefix (before first dot)
+            top = k.split(".")[0]
+            prefix_counts.setdefault(top, 0)
+            prefix_counts[top] += v.numel()
+        total = sum(p.numel() for p in state.values())
+        print("=== Parameter Counts by Prefix ===")
+        for pfx, cnt in sorted(prefix_counts.items(), key=lambda x: -x[1]):
+            pct = 100.0 * cnt / max(1, total)
+            print(f"{pfx:20s} {cnt:12d} ({pct:5.2f}%)")
+        print(f"Total parameters (tensors): {total}")
+
+    # Emit config (inferred)
+    if args.emit_config:
+        try:
+            arch = result.get("architecture")
+            common = result.get("common", {})
+            details = result.get("details", {})
+            cfg = {
+                "input": {
+                    "primitive_vocab_size": common.get("vocab_size"),
+                    "embedding_dim": common.get("embedding_dim"),
+                    "normalize_embeddings": False,
+                },
+                "model": {
+                    "architecture": arch,
+                },
+            }
+            if arch == "cnn":
+                cfg["model"]["cnn"] = {
+                    "stages": details.get("stages") or [],
+                    "blocks_per_stage": details.get("blocks_per_stage") or [],
+                    "kernel_size": 3,
+                    "stem_kernel_size": 3,
+                    "stem_stride": 1,
+                    "downsample": "conv",
+                    "activation": "gelu",
+                    "dropout": 0.1,
+                    "classifier_hidden_dim": details.get("classifier_hidden_dim", 0),
+                    "classifier_dropout": 0.2,
+                }
+            elif arch == "transformer":
+                cfg["input"]["positional_encoding"] = "sinusoidal_2d"
+                cfg["input"]["combine_mode"] = "add"
+                cfg["input"]["patch_grouping"] = {
+                    "enabled": True,
+                    "patch_rows": 4,
+                    "patch_cols": 4,
+                }
+                cfg["input"]["token_pooling"] = "cls"
+                cfg["input"]["use_cls_token"] = True
+                cfg["model"]["transformer"] = {
+                    "d_model": details.get("d_model"),
+                    "num_layers": details.get("num_layers"),
+                    "num_heads": details.get("num_heads_inferred"),
+                    "mlp_hidden_dim": details.get("mlp_hidden_dim"),
+                    "dropout": 0.1,
+                    "attention_dropout": 0.1,
+                    "layer_norm_eps": 1e-5,
+                    "pre_norm": True,
+                }
+                cfg["model"]["classifier"] = {
+                    "hidden_dim": details.get("classifier_hidden_dim"),
+                    "dropout": 0.1,
+                    "activation": "gelu",
+                }
+            args.emit_config.parent.mkdir(parents=True, exist_ok=True)
+            with args.emit_config.open("w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2)
+            print(f"[info] Inferred config written to {args.emit_config}")
+        except Exception as e:
+            print(f"[warn] Failed to emit config: {e}", file=sys.stderr)
+
+    if args.keys_jsonl:
+        try:
+            args.keys_jsonl.parent.mkdir(parents=True, exist_ok=True)
+            with args.keys_jsonl.open("w", encoding="utf-8") as f:
+                for k in keys[: args.limit_keys or None]:
+                    t = state[k]
+                    rec = {
+                        "name": k,
+                        "shape": list(t.shape),
+                        "dtype": str(t.dtype),
+                        "numel": t.numel(),
+                    }
+                    f.write(json.dumps(rec) + "\n")
+            print(f"[info] Wrote key metadata JSONL to {args.keys_jsonl}")
+        except Exception as e:
+            print(f"[warn] Could not write keys JSONL: {e}", file=sys.stderr)
 
     if args.json_out:
         try:
