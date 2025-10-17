@@ -484,6 +484,45 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Iterate over all glyph classes; for each class sample up to --limit rasters matching that class label base. Uses filename prefix before last underscore for matching.",
     )
+    ap.add_argument(
+        "--use-test-split",
+        action="store_true",
+        help="Restrict inference to glyph_ids listed in phase2_test_ids.txt (derived from label_map parent / splits or --splits-dir).",
+    )
+    ap.add_argument(
+        "--splits-dir",
+        type=Path,
+        default=None,
+        help="Optional explicit splits directory containing phase2_test_ids.txt (defaults to <label_map_dir>/splits).",
+    )
+    ap.add_argument(
+        "--use-memmap-grids",
+        action="store_true",
+        help="Use memmap grids_uint16.npy + glyph_row_ids.npy directly (bypass Phase 1 cell inference). Applies test split filtering if --use-test-split is set.",
+    )
+    ap.add_argument(
+        "--memmap-grids-file",
+        type=Path,
+        default=Path("data/grids_memmap/grids_uint16.npy"),
+        help="Path to memmap grids file when --use-memmap-grids is enabled.",
+    )
+    ap.add_argument(
+        "--memmap-row-ids-file",
+        type=Path,
+        default=Path("data/grids_memmap/glyph_row_ids.npy"),
+        help="Path to memmap glyph_row_ids.npy when --use-memmap-grids is enabled.",
+    )
+    ap.add_argument(
+        "--glyph-labels-file",
+        type=Path,
+        default=Path("data/grids_memmap/glyph_labels.jsonl"),
+        help="Optional glyph_labels.jsonl mapping (glyph_id -> label string); if absent will attempt to derive from label_map keys.",
+    )
+    ap.add_argument(
+        "--summary",
+        action="store_true",
+        help="Print summary metrics (top1 accuracy, top5 contains rate) after inference (raster mode only).",
+    )
     return ap.parse_args(argv)
 
 
@@ -740,32 +779,163 @@ def main(argv: Optional[List[str]] = None) -> None:
             except Exception:
                 pass
 
-    rasters = sorted([p for p in args.rasters_dir.glob("*.png")])
-    if args.all_classes:
-        # Build mapping from input label prefix to list of paths
-        per_label: Dict[str, List[Path]] = {}
-        for rp in rasters:
-            stem = rp.stem
-            input_label_prefix = stem.rsplit("_", 1)[0] if "_" in stem else stem
-            per_label.setdefault(input_label_prefix, []).append(rp)
-        # Sample up to limit per class (randomized if --shuffle else first N)
-        selected: List[Path] = []
-        rng = random.Random(args.seed)
-        for lbl, paths in per_label.items():
-            if args.shuffle:
-                rng.shuffle(paths)
-            take = paths[: args.limit] if args.limit > 0 else paths
-            selected.extend(take)
-        rasters = selected
-    else:
-        if args.shuffle:
-            random.shuffle(rasters)
-        if args.limit > 0:
-            rasters = rasters[: args.limit]
+    # ------------------------------------------------------------------
+    # Test split loading (glyph_id list) if requested
+    # ------------------------------------------------------------------
+    test_ids_set: Optional[set[int]] = None
+    if args.use_test_split:
+        splits_dir = args.splits_dir or (args.label_map.parent / "splits")
+        test_file = splits_dir / "phase2_test_ids.txt"
+        if not test_file.exists():
+            print(f"[error] Test split file not found: {test_file}", file=sys.stderr)
+            return
+        try:
+            test_ids = [int(line.strip()) for line in test_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+            test_ids_set = set(test_ids)
+            print(f"[INFO] Loaded test split IDs: {len(test_ids_set)}", flush=True)
+        except Exception as e:
+            print(f"[error] Failed reading test split file: {e}", file=sys.stderr)
+            return
 
-    if not rasters:
-        print("[warn] No raster PNG files found.", file=sys.stderr)
-        return
+    # ------------------------------------------------------------------
+    # MEMMAP GRID MODE
+    # ------------------------------------------------------------------
+    # Enforce raster-only when user requests test split evaluation with Phase 1 reconstruction
+    # (Ignore memmap mode if --use-test-split is set to honor user preference for raster inference.)
+    if args.use_test_split and args.use_memmap_grids:
+        print("[INFO] Ignoring --use-memmap-grids because --use-test-split requested (raster + Phase 1 inference).", flush=True)
+        memmap_mode = False
+    else:
+        memmap_mode = args.use_memmap_grids
+    memmap_grids: Optional[Any] = None
+    memmap_row_ids: Optional[Any] = None
+    glyph_id_to_label: Dict[int, str] = {}
+
+    if memmap_mode:
+        import numpy as np
+        if not args.memmap_grids_file.exists() or not args.memmap_row_ids_file.exists():
+            print("[error] Memmap files missing; disable --use-memmap-grids or provide correct paths.", file=sys.stderr)
+            return
+        try:
+            row_ids_arr = np.load(args.memmap_row_ids_file)
+            mm = np.memmap(args.memmap_grids_file, dtype=np.uint16, mode="r")
+            if mm.size % 256 != 0:
+                raise RuntimeError("Memmap size not divisible by 256.")
+            total = mm.size // 256
+            mm = mm.reshape(total, 16, 16)
+            if len(row_ids_arr) != total:
+                raise RuntimeError("glyph_row_ids length mismatch memmap grid count.")
+            memmap_grids = mm
+            memmap_row_ids = row_ids_arr
+        except Exception as e:
+            print(f"[error] Failed loading memmap grids: {e}", file=sys.stderr)
+            return
+        # Optional glyph_labels_file mapping (glyph_id -> label string)
+        if args.glyph_labels_file.exists():
+            try:
+                for line in args.glyph_labels_file.read_text(encoding="utf-8").splitlines():
+                    if not line.strip():
+                        continue
+                    import json
+                    rec = json.loads(line)
+                    gid = int(rec.get("glyph_id"))
+                    lbl = rec.get("label") or rec.get("glyph_label") or rec.get("label_string")
+                    if lbl is not None:
+                        glyph_id_to_label[gid] = str(lbl)
+            except Exception:
+                pass
+        # Fallback: derive label string from label_map keys pattern "<glyphid>_<rest>"
+        if not glyph_id_to_label:
+            for k in label_map.keys():
+                try:
+                    # if key starts with integer id followed by underscore
+                    parts = k.split("_", 1)
+                    if parts and parts[0].isdigit():
+                        gid = int(parts[0])
+                        glyph_id_to_label.setdefault(gid, k)
+                except Exception:
+                    continue
+
+        # Build list of glyph indices respecting test split
+        chosen_positions: List[int] = []
+        for pos, gid in enumerate(memmap_row_ids.tolist()):
+            if test_ids_set and gid not in test_ids_set:
+                continue
+            chosen_positions.append(pos)
+
+        if not chosen_positions:
+            print("[warn] No glyph positions selected (check test split filtering).", file=sys.stderr)
+
+        # If --limit applies as samples per class, we need grouping by label base
+        if args.all_classes:
+            # Group by label string
+            per_label_positions: Dict[str, List[int]] = {}
+            for pos in chosen_positions:
+                gid = int(memmap_row_ids[pos])
+                lbl = glyph_id_to_label.get(gid, f"{gid}")
+                per_label_positions.setdefault(lbl, []).append(pos)
+            rng = random.Random(args.seed)
+            selected_positions: List[int] = []
+            for lbl, plist in per_label_positions.items():
+                if args.shuffle:
+                    rng.shuffle(plist)
+                take = plist[: args.limit] if args.limit > 0 else plist
+                selected_positions.extend(take)
+            chosen_positions = selected_positions
+        else:
+            if args.shuffle:
+                rng = random.Random(args.seed)
+                rng.shuffle(chosen_positions)
+            if args.limit > 0:
+                chosen_positions = chosen_positions[: args.limit]
+
+        if not chosen_positions:
+            print("[warn] No glyphs after sampling; aborting.", file=sys.stderr)
+            return
+
+        print(f"[INFO] Memmap inference | selected_grids={len(chosen_positions)}", flush=True)
+
+    # ------------------------------------------------------------------
+    # RASTER MODE
+    # ------------------------------------------------------------------
+    rasters: List[Path] = []
+    if not memmap_mode:
+        rasters = sorted([p for p in args.rasters_dir.glob("*.png")])
+        # Test split filtering (extract trailing numeric id)
+        if test_ids_set:
+            filtered = []
+            for rp in rasters:
+                stem = rp.stem
+                # Expect last underscore component to be numeric glyph_id
+                parts = stem.rsplit("_", 1)
+                if len(parts) == 2 and parts[1].isdigit():
+                    gid = int(parts[1])
+                    if gid in test_ids_set:
+                        filtered.append(rp)
+            rasters = filtered
+        if args.all_classes:
+            per_label: Dict[str, List[Path]] = {}
+            for rp in rasters:
+                stem = rp.stem
+                input_label_prefix = stem.rsplit("_", 1)[0] if "_" in stem else stem
+                per_label.setdefault(input_label_prefix, []).append(rp)
+            selected: List[Path] = []
+            rng = random.Random(args.seed)
+            for lbl, paths in per_label.items():
+                if args.shuffle:
+                    rng.shuffle(paths)
+                take = paths[: args.limit] if args.limit > 0 else paths
+                selected.extend(take)
+            rasters = selected
+        else:
+            if args.shuffle:
+                random.shuffle(rasters)
+            if args.limit > 0:
+                rasters = rasters[: args.limit]
+
+        if not rasters:
+            print("[warn] No raster PNG files found.", file=sys.stderr)
+            return
 
     print(
         f"[INFO] Starting inference | rasters={len(rasters)} | device={DEVICE.type} "
@@ -776,16 +946,54 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     json_rows: List[Dict[str, Any]] = []
 
-    for idx, raster_path in enumerate(rasters, start=1):
-        try:
-            grid = raster_to_primitive_grid(raster_path, phase1)
-            if args.show_grid and not args.quiet:
-                # Print grid as small ASCII matrix (primitive IDs)
-                grid_str = "\n".join(
-                    " ".join(f"{int(v):04d}" for v in row.tolist())
-                    for row in grid.tolist()
-                )
-                print(f"[GRID] {raster_path.name}\n{grid_str}")
+    if memmap_mode:
+        # Direct grid inference loop
+        for pos in chosen_positions:
+            gid = int(memmap_row_ids[pos])
+            raw_grid = memmap_grids[pos]  # numpy (16,16)
+            grid = torch.from_numpy(raw_grid.astype("int64"))
+            with torch.no_grad():
+                label_indices, probs = predict_glyph_grid(grid, phase2, topk=args.topk)
+            labels = [inv_labels[i] for i in label_indices]
+            bases = [base_unicode_map.get(lbl, "?") for lbl in labels]
+            top1_label = labels[0]
+            top1_base = bases[0]
+            input_label = glyph_id_to_label.get(gid, str(gid))
+            # Input base unicode (derive similarly to raster mode)
+            input_base = base_unicode_map.get(input_label, "?")
+            if input_label == top1_label:
+                status_emoji = "✅"
+            elif input_label in labels[1 : args.topk]:
+                status_emoji = "❗"
+            else:
+                status_emoji = "❌"
+            top5_bases = ", ".join(bases[: args.topk])
+            print(f"{input_base} -> {top1_base} [{top5_bases}] (glyph_{gid}.memmap) {status_emoji}", flush=True)
+            json_rows.append(
+                {
+                    "glyph_id": gid,
+                    "file": f"glyph_{gid}.memmap",
+                    "topk": [
+                        {
+                            "rank": r + 1,
+                            "label": labels[r],
+                            "base": bases[r],
+                            "prob": probs[r],
+                        }
+                        for r in range(len(labels))
+                    ],
+                }
+            )
+    else:
+        for idx, raster_path in enumerate(rasters, start=1):
+            try:
+                grid = raster_to_primitive_grid(raster_path, phase1)
+                if args.show_grid and not args.quiet:
+                    grid_str = "\n".join(
+                        " ".join(f"{int(v):04d}" for v in row.tolist())
+                        for row in grid.tolist()
+                    )
+                    print(f"[GRID] {raster_path.name}\n{grid_str}")
 
             label_indices, probs = predict_glyph_grid(grid, phase2, topk=args.topk)
             labels = [inv_labels[i] for i in label_indices]
@@ -839,6 +1047,26 @@ def main(argv: Optional[List[str]] = None) -> None:
         if not args.quiet:
             print(f"[INFO] Wrote JSONL predictions to {args.output_json}", flush=True)
 
+    # Summary metrics (raster mode only)
+    if not memmap_mode and args.summary and json_rows:
+        total = len(json_rows)
+        top1_matches = 0
+        top5_contains = 0
+        for rec in json_rows:
+            # Reconstruct input label prefix from filename
+            fname = rec["file"]
+            stem = Path(fname).stem
+            input_label = stem.rsplit("_", 1)[0] if "_" in stem else stem
+            topk_labels = [entry["label"] for entry in rec["topk"]]
+            if topk_labels and input_label == topk_labels[0]:
+                top1_matches += 1
+                top5_contains += 1  # top1 is also in top5
+            elif input_label in topk_labels[1:]:
+                top5_contains += 1
+        top1_acc = top1_matches / total if total else 0.0
+        top5_contain_rate = top5_contains / total if total else 0.0
+        print(f"[SUMMARY] samples={total} top1_acc={top1_acc:.4f} top5_contains_rate={top5_contain_rate:.4f} "
+              f"top1_matches={top1_matches} top5_contains={top5_contains}", flush=True)
     print("[DONE] Inference complete.", flush=True)
 
 
