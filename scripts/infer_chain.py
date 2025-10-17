@@ -59,6 +59,16 @@ from PIL import Image
 
 import torch
 from torch import nn
+import random
+
+
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
 
 # Project-local imports (factories)
 import os, sys
@@ -408,7 +418,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=str,
         default=None,
         choices=["cnn", "transformer"],
-        help="Override Phase 2 architecture.",
+        help="Override Phase 2 architecture (ignored if --baseline_phase2 set).",
     )
     ap.add_argument(
         "--config_yaml",
@@ -433,6 +443,22 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Print primitive grid (text) for debugging.",
     )
+    ap.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducibility (shuffling, torch, numpy).",
+    )
+    ap.add_argument(
+        "--shuffle",
+        action="store_true",
+        help="Shuffle raster processing order after sorting.",
+    )
+    ap.add_argument(
+        "--baseline_phase2",
+        action="store_true",
+        help="Force loading Phase 2 checkpoint with baseline CNN architecture (embedding_dim=64, stages [64,128,192]).",
+    )
     return ap.parse_args(argv)
 
 
@@ -456,17 +482,60 @@ def main(argv: Optional[List[str]] = None) -> None:
     label_map, inv_labels = load_label_map(args.label_map)
     base_unicode_map = load_chars_csv(args.chars_csv)
 
+    # Set seed
+    set_seed(args.seed)
+
     # Build models
     phase1 = load_phase1_model(args.phase1_ckpt)
     yaml_cfg = safe_load_yaml(args.config_yaml)
-    phase2 = load_phase2_model(
-        ckpt_path=args.phase2_ckpt,
-        num_labels=len(inv_labels),
-        arch_arg=args.arch,
-        yaml_cfg=yaml_cfg,
-    )
+
+    if args.baseline_phase2:
+        # Baseline CNN spec matching original smaller architecture (to avoid missing keys)
+        baseline_cfg = {
+            "input": {
+                "primitive_vocab_size": 1024,
+                "embedding_dim": 64,
+                "normalize_embeddings": False,
+            },
+            "model": {
+                "architecture": "cnn",
+                "cnn": {
+                    "stages": [64, 128, 192],
+                    "blocks_per_stage": [2, 2, 2],
+                    "kernel_size": 3,
+                    "stem_kernel_size": 3,
+                    "stem_stride": 1,
+                    "downsample": "conv",
+                    "activation": "gelu",
+                    "dropout": 0.1,
+                    "classifier_hidden_dim": 0,
+                    "classifier_dropout": 0.2,
+                },
+                "init": {
+                    "embedding_from_centroids": False,
+                    "centroid_requires_grad": True,
+                    "weight_init": "xavier_uniform",
+                },
+            },
+        }
+        phase2 = build_phase2_cnn_model(
+            baseline_cfg, num_labels=len(inv_labels), primitive_centroids=None
+        )
+        payload = torch.load(str(args.phase2_ckpt), map_location="cpu")
+        state = payload.get("model_state") or payload
+        phase2.load_state_dict(state, strict=False)
+        phase2.to(DEVICE).eval()
+    else:
+        phase2 = load_phase2_model(
+            ckpt_path=args.phase2_ckpt,
+            num_labels=len(inv_labels),
+            arch_arg=args.arch,
+            yaml_cfg=yaml_cfg,
+        )
 
     rasters = sorted([p for p in args.rasters_dir.glob("*.png")])
+    if args.shuffle:
+        random.shuffle(rasters)
     if args.limit > 0:
         rasters = rasters[: args.limit]
 
