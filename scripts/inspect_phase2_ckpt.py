@@ -68,46 +68,88 @@ def load_state(ckpt_path: Path):
 
 
 def classify_arch(keys: List[str]) -> str:
-    """Return 'transformer', 'cnn', or 'unknown'."""
-    lower_keys = keys  # already strings
+    """Return 'transformer', 'cnn', or 'unknown'.
+
+    Enhanced:
+      - Handles optional leading prefixes: 'model.', 'module.', 'net.'.
+      - More robust CNN detection via presence of any 'features.' residual pattern.
+      - More robust transformer detection via any 'encoder.' or multi-head attn pattern.
+    """
+    # Strip common wrappers
+    normalized = []
+    for k in keys:
+        nk = k
+        for prefix in ("model.", "module.", "net."):
+            if nk.startswith(prefix):
+                nk = nk[len(prefix) :]
+        normalized.append(nk)
+
     # Transformer indicators
-    t_indicators = [
-        any(k.startswith("encoder.") for k in lower_keys),
-        any("cls_token" in k for k in lower_keys),
-        any("primitive_embedding.weight" in k for k in lower_keys),
-        any("positional." in k for k in lower_keys),
-    ]
-    if any(t_indicators):
+    if any(
+        ("encoder." in k)
+        or ("cls_token" in k)
+        or ("primitive_embedding.weight" in k)
+        or ("positional" in k)
+        or ("multihead" in k)
+        for k in normalized
+    ):
         return "transformer"
-    # CNN indicators
-    c_indicators = [
-        any(k.startswith("stem.conv") for k in lower_keys),
-        any("features.0.conv1.conv.weight" in k for k in lower_keys),
-        any("features.0.conv.weight" in k for k in lower_keys),
-    ]
-    if any(c_indicators):
+
+    # CNN indicators (stem + features residual blocks)
+    if any(
+        ("stem.conv" in k)
+        or ("features." in k and ".conv1.conv.weight" in k)
+        or ("features." in k and ".conv.weight" in k and ".conv1." not in k)
+        for k in normalized
+    ):
         return "cnn"
+
     return "unknown"
 
 
 def extract_common(state: Dict[str, torch.Tensor]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
-    # Embedding weight can be 'embedding.weight' (CNN) or 'primitive_embedding.weight' (Transformer)
+    # Normalize keys (remove common prefixes)
+    remapped: Dict[str, torch.Tensor] = {}
+    for k, v in state.items():
+        nk = k
+        for prefix in ("model.", "module.", "net."):
+            if nk.startswith(prefix):
+                nk = nk[len(prefix) :]
+        remapped[nk] = v
+
+    # Candidate embedding keys (CNN / Transformer)
     emb_key = None
-    for candidate in ("embedding.weight", "primitive_embedding.weight"):
-        if candidate in state:
+    for candidate in (
+        "embedding.weight",
+        "primitive_embedding.weight",
+        "embed.embedding.weight",
+    ):
+        if candidate in remapped:
             emb_key = candidate
             break
+
     if emb_key:
-        w = state[emb_key]
+        w = remapped[emb_key]
         out["vocab_size"] = w.shape[0]
-        if w.dim() == 2:
-            out["embedding_dim"] = w.shape[1]
-        else:
-            out["embedding_dim"] = "unknown"
+        out["embedding_dim"] = w.shape[1] if w.dim() == 2 else "unknown"
     else:
-        out["vocab_size"] = "unknown"
-        out["embedding_dim"] = "unknown"
+        # Fallback heuristic: find any weight with shape[0] in typical vocab range (900..1300)
+        vocab_like = [
+            (k, t)
+            for k, t in remapped.items()
+            if t.dim() == 2 and 900 <= t.shape[0] <= 1300
+        ]
+        if vocab_like:
+            # Choose tensor with smallest second dim as embedding (usual embedding_dim < hidden_dim)
+            vocab_like.sort(key=lambda x: x[1].shape[1])
+            k_sel, t_sel = vocab_like[0]
+            out["vocab_size"] = t_sel.shape[0]
+            out["embedding_dim"] = t_sel.shape[1]
+            out["embedding_inferred_from"] = k_sel
+        else:
+            out["vocab_size"] = "unknown"
+            out["embedding_dim"] = "unknown"
 
     # Try to infer number of labels from classifier last linear layer
     classifier_candidates = [
@@ -337,13 +379,22 @@ def inspect(ckpt_path: Path, verbose: bool = False) -> Dict[str, Any]:
         raise ValueError("Checkpoint does not contain a dict-like state.")
     keys = list(state.keys())
     arch = classify_arch(keys)
+    # Rebuild remapped dict for downstream detail extraction (prefix stripping)
+    cleaned_state: Dict[str, torch.Tensor] = {}
+    for k, v in state.items():
+        nk = k
+        for prefix in ("model.", "module.", "net."):
+            if nk.startswith(prefix):
+                nk = nk[len(prefix) :]
+        cleaned_state[nk] = v
+    # Use cleaned_state for detail extraction to increase robustness
 
     common = extract_common(state)
     details: Dict[str, Any] = {}
     if arch == "cnn":
-        details = extract_cnn_details(state)
+        details = extract_cnn_details(cleaned_state)
     elif arch == "transformer":
-        details = extract_transformer_details(state)
+        details = extract_transformer_details(cleaned_state)
 
     result = {
         "checkpoint": str(ckpt_path),
