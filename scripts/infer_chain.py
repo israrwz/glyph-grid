@@ -790,7 +790,11 @@ def main(argv: Optional[List[str]] = None) -> None:
             print(f"[error] Test split file not found: {test_file}", file=sys.stderr)
             return
         try:
-            test_ids = [int(line.strip()) for line in test_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+            test_ids = [
+                int(line.strip())
+                for line in test_file.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
             test_ids_set = set(test_ids)
             print(f"[INFO] Loaded test split IDs: {len(test_ids_set)}", flush=True)
         except Exception as e:
@@ -803,7 +807,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     # Enforce raster-only when user requests test split evaluation with Phase 1 reconstruction
     # (Ignore memmap mode if --use-test-split is set to honor user preference for raster inference.)
     if args.use_test_split and args.use_memmap_grids:
-        print("[INFO] Ignoring --use-memmap-grids because --use-test-split requested (raster + Phase 1 inference).", flush=True)
+        print(
+            "[INFO] Ignoring --use-memmap-grids because --use-test-split requested (raster + Phase 1 inference).",
+            flush=True,
+        )
         memmap_mode = False
     else:
         memmap_mode = args.use_memmap_grids
@@ -813,8 +820,12 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     if memmap_mode:
         import numpy as np
+
         if not args.memmap_grids_file.exists() or not args.memmap_row_ids_file.exists():
-            print("[error] Memmap files missing; disable --use-memmap-grids or provide correct paths.", file=sys.stderr)
+            print(
+                "[error] Memmap files missing; disable --use-memmap-grids or provide correct paths.",
+                file=sys.stderr,
+            )
             return
         try:
             row_ids_arr = np.load(args.memmap_row_ids_file)
@@ -833,13 +844,20 @@ def main(argv: Optional[List[str]] = None) -> None:
         # Optional glyph_labels_file mapping (glyph_id -> label string)
         if args.glyph_labels_file.exists():
             try:
-                for line in args.glyph_labels_file.read_text(encoding="utf-8").splitlines():
+                for line in args.glyph_labels_file.read_text(
+                    encoding="utf-8"
+                ).splitlines():
                     if not line.strip():
                         continue
                     import json
+
                     rec = json.loads(line)
                     gid = int(rec.get("glyph_id"))
-                    lbl = rec.get("label") or rec.get("glyph_label") or rec.get("label_string")
+                    lbl = (
+                        rec.get("label")
+                        or rec.get("glyph_label")
+                        or rec.get("label_string")
+                    )
                     if lbl is not None:
                         glyph_id_to_label[gid] = str(lbl)
             except Exception:
@@ -864,7 +882,10 @@ def main(argv: Optional[List[str]] = None) -> None:
             chosen_positions.append(pos)
 
         if not chosen_positions:
-            print("[warn] No glyph positions selected (check test split filtering).", file=sys.stderr)
+            print(
+                "[warn] No glyph positions selected (check test split filtering).",
+                file=sys.stderr,
+            )
 
         # If --limit applies as samples per class, we need grouping by label base
         if args.all_classes:
@@ -893,7 +914,10 @@ def main(argv: Optional[List[str]] = None) -> None:
             print("[warn] No glyphs after sampling; aborting.", file=sys.stderr)
             return
 
-        print(f"[INFO] Memmap inference | selected_grids={len(chosen_positions)}", flush=True)
+        print(
+            f"[INFO] Memmap inference | selected_grids={len(chosen_positions)}",
+            flush=True,
+        )
 
     # ------------------------------------------------------------------
     # RASTER MODE
@@ -968,7 +992,10 @@ def main(argv: Optional[List[str]] = None) -> None:
             else:
                 status_emoji = "❌"
             top5_bases = ", ".join(bases[: args.topk])
-            print(f"{input_base} -> {top1_base} [{top5_bases}] (glyph_{gid}.memmap) {status_emoji}", flush=True)
+            print(
+                f"{input_base} -> {top1_base} [{top5_bases}] (glyph_{gid}.memmap) {status_emoji}",
+                flush=True,
+            )
             json_rows.append(
                 {
                     "glyph_id": gid,
@@ -994,10 +1021,15 @@ def main(argv: Optional[List[str]] = None) -> None:
                         for row in grid.tolist()
                     )
                     print(f"[GRID] {raster_path.name}\n{grid_str}")
-
-            label_indices, probs = predict_glyph_grid(grid, phase2, topk=args.topk)
-            labels = [inv_labels[i] for i in label_indices]
-            bases = [base_unicode_map.get(lbl, "?") for lbl in labels]
+                label_indices, probs = predict_glyph_grid(grid, phase2, topk=args.topk)
+                labels = [inv_labels[i] for i in label_indices]
+                bases = [base_unicode_map.get(lbl, "?") for lbl in labels]
+            except Exception as e:
+                print(
+                    f"[error] Inference failed for {raster_path.name}: {e}",
+                    file=sys.stderr,
+                )
+                continue
 
             if not args.quiet:
                 top1_label = labels[0]
@@ -1039,9 +1071,6 @@ def main(argv: Optional[List[str]] = None) -> None:
                 }
             )
 
-        except Exception as e:
-            print(f"[error] Failed on {raster_path.name}: {e}", file=sys.stderr)
-
     if args.output_json:
         write_jsonl(args.output_json, json_rows)
         if not args.quiet:
@@ -1065,8 +1094,11 @@ def main(argv: Optional[List[str]] = None) -> None:
                 top5_contains += 1
         top1_acc = top1_matches / total if total else 0.0
         top5_contain_rate = top5_contains / total if total else 0.0
-        print(f"[SUMMARY] samples={total} top1_acc={top1_acc:.4f} top5_contains_rate={top5_contain_rate:.4f} "
-              f"top1_matches={top1_matches} top5_contains={top5_contains}", flush=True)
+        print(
+            f"[SUMMARY] samples={total} top1_acc={top1_acc:.4f} top5_contains_rate={top5_contain_rate:.4f} "
+            f"top1_matches={top1_matches} top5_contains={top5_contains}",
+            flush=True,
+        )
     print("[DONE] Inference complete.", flush=True)
 
 
