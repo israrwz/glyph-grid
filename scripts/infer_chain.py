@@ -479,6 +479,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Force loading Phase 2 checkpoint with baseline CNN architecture (embedding_dim=64, stages [64,128,192]).",
     )
+    ap.add_argument(
+        "--all-classes",
+        action="store_true",
+        help="Iterate over all glyph classes; for each class sample up to --limit rasters matching that class label base. Uses filename prefix before last underscore for matching.",
+    )
     return ap.parse_args(argv)
 
 
@@ -736,10 +741,27 @@ def main(argv: Optional[List[str]] = None) -> None:
                 pass
 
     rasters = sorted([p for p in args.rasters_dir.glob("*.png")])
-    if args.shuffle:
-        random.shuffle(rasters)
-    if args.limit > 0:
-        rasters = rasters[: args.limit]
+    if args.all_classes:
+        # Build mapping from input label prefix to list of paths
+        per_label: Dict[str, List[Path]] = {}
+        for rp in rasters:
+            stem = rp.stem
+            input_label_prefix = stem.rsplit("_", 1)[0] if "_" in stem else stem
+            per_label.setdefault(input_label_prefix, []).append(rp)
+        # Sample up to limit per class (randomized if --shuffle else first N)
+        selected: List[Path] = []
+        rng = random.Random(args.seed)
+        for lbl, paths in per_label.items():
+            if args.shuffle:
+                rng.shuffle(paths)
+            take = paths[: args.limit] if args.limit > 0 else paths
+            selected.extend(take)
+        rasters = selected
+    else:
+        if args.shuffle:
+            random.shuffle(rasters)
+        if args.limit > 0:
+            rasters = rasters[: args.limit]
 
     if not rasters:
         print("[warn] No raster PNG files found.", file=sys.stderr)
@@ -776,11 +798,21 @@ def main(argv: Optional[List[str]] = None) -> None:
                 stem = raster_path.stem
                 input_label = stem.rsplit("_", 1)[0] if "_" in stem else stem
                 input_base = base_unicode_map.get(input_label, "?")
-                # New concise log format:
-                # {input unicode} -> {top match unicode} [top5 unicodes] (filename)
+                # Determine match status emoji:
+                # ✅ if top1 label matches input_label
+                # ❗ if input_label appears in remaining top-K
+                # ❌ otherwise
+                if input_label == top1_label:
+                    status_emoji = "✅"
+                elif input_label in labels[1 : args.topk]:
+                    status_emoji = "❗"
+                else:
+                    status_emoji = "❌"
+                # Concise log format:
+                # {input unicode} -> {top match unicode} [top5 unicodes] (filename) {emoji}
                 top5_bases = ", ".join(bases[: args.topk])
                 print(
-                    f"{input_base} -> {top1_base} [{top5_bases}] ({raster_path.name})",
+                    f"{input_base} -> {top1_base} [{top5_bases}] ({raster_path.name}) {status_emoji}",
                     flush=True,
                 )
 
