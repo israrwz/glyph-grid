@@ -526,12 +526,105 @@ def main(argv: Optional[List[str]] = None) -> None:
         phase2.load_state_dict(state, strict=False)
         phase2.to(DEVICE).eval()
     else:
-        phase2 = load_phase2_model(
-            ckpt_path=args.phase2_ckpt,
-            num_labels=len(inv_labels),
-            arch_arg=args.arch,
-            yaml_cfg=yaml_cfg,
-        )
+        phase2 = None
+        missing_after = None
+        # Primary load (either explicit baseline or dynamic)
+        if args.baseline_phase2:
+            baseline_cfg = {
+                "input": {
+                    "primitive_vocab_size": 1024,
+                    "embedding_dim": 64,
+                    "normalize_embeddings": False,
+                },
+                "model": {
+                    "architecture": "cnn",
+                    "cnn": {
+                        "stages": [64, 128, 192],
+                        "blocks_per_stage": [2, 2, 2],
+                        "kernel_size": 3,
+                        "stem_kernel_size": 3,
+                        "stem_stride": 1,
+                        "downsample": "conv",
+                        "activation": "gelu",
+                        "dropout": 0.1,
+                        "classifier_hidden_dim": 0,
+                        "classifier_dropout": 0.2,
+                    },
+                    "init": {
+                        "embedding_from_centroids": False,
+                        "centroid_requires_grad": True,
+                        "weight_init": "xavier_uniform",
+                    },
+                },
+            }
+            phase2 = build_phase2_cnn_model(
+                baseline_cfg, num_labels=len(inv_labels), primitive_centroids=None
+            )
+            payload = torch.load(str(args.phase2_ckpt), map_location="cpu")
+            state = payload.get("model_state") or payload
+            phase2.load_state_dict(state, strict=False)
+            phase2.to(DEVICE).eval()
+        else:
+            # Try dynamic loader first
+            phase2 = load_phase2_model(
+                ckpt_path=args.phase2_ckpt,
+                num_labels=len(inv_labels),
+                arch_arg=args.arch,
+                yaml_cfg=yaml_cfg,
+            )
+            # Heuristic: if we see a large block of missing CNN weights (e.g., embedding.weight) it likely means
+            # the checkpoint is for the *baseline* architecture but we instantiated the *capacity* CNN.
+            # Auto-retry with baseline spec (unless transformer was explicitly requested).
+            # We infer mismatch if embedding.weight missing and model has attribute 'embedding'.
+            # Suppress second warning after successful fallback.
+            try:
+                # Re-load raw payload to inspect keys vs model
+                payload = torch.load(str(args.phase2_ckpt), map_location="cpu")
+                state = payload.get("model_state") or payload
+                model_keys = set(phase2.state_dict().keys())
+                missing_after = [k for k in model_keys if k not in state]
+                if "embedding.weight" in missing_after and args.arch != "transformer":
+                    print(
+                        "[INFO] Detected architecture mismatch; retrying with baseline Phase 2 CNN spec.",
+                        flush=True,
+                    )
+                    baseline_cfg = {
+                        "input": {
+                            "primitive_vocab_size": 1024,
+                            "embedding_dim": 64,
+                            "normalize_embeddings": False,
+                        },
+                        "model": {
+                            "architecture": "cnn",
+                            "cnn": {
+                                "stages": [64, 128, 192],
+                                "blocks_per_stage": [2, 2, 2],
+                                "kernel_size": 3,
+                                "stem_kernel_size": 3,
+                                "stem_stride": 1,
+                                "downsample": "conv",
+                                "activation": "gelu",
+                                "dropout": 0.1,
+                                "classifier_hidden_dim": 0,
+                                "classifier_dropout": 0.2,
+                            },
+                            "init": {
+                                "embedding_from_centroids": False,
+                                "centroid_requires_grad": True,
+                                "weight_init": "xavier_uniform",
+                            },
+                        },
+                    }
+                    phase2 = build_phase2_cnn_model(
+                        baseline_cfg,
+                        num_labels=len(inv_labels),
+                        primitive_centroids=None,
+                    )
+                    phase2.load_state_dict(state, strict=False)
+                    phase2.to(DEVICE).eval()
+                    missing_after = None  # suppress warning print below
+            except Exception:
+                pass
 
     rasters = sorted([p for p in args.rasters_dir.glob("*.png")])
     if args.shuffle:
@@ -570,8 +663,13 @@ def main(argv: Optional[List[str]] = None) -> None:
             if not args.quiet:
                 top1_label = labels[0]
                 top1_base = bases[0]
+                # Derive input label (everything before last underscore) to map its base char (if available)
+                stem = raster_path.stem
+                input_label = stem.rsplit("_", 1)[0] if "_" in stem else stem
+                input_base = base_unicode_map.get(input_label, "?")
                 print(
-                    f"{raster_path.name}: top1_label={top1_label} top1_base={top1_base} "
+                    f"{raster_path.name}: input_label={input_label} input_base={input_base} "
+                    f"top1_label={top1_label} top1_base={top1_base} "
                     f"prob={probs[0]:.4f} | topk={[(l, b, round(p, 4)) for l, b, p in zip(labels, bases, probs)]}",
                     flush=True,
                 )
