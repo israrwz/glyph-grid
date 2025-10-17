@@ -554,7 +554,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             cleaned = {}
             for k, v in raw_state.items():
                 nk = k
-                for prefix in ("model.", "module.", "net."):
+                for prefix in ("model.", "module.", "net.", "_orig_mod."):
                     if nk.startswith(prefix):
                         nk = nk[len(prefix) :]
                 cleaned[nk] = v
@@ -562,7 +562,11 @@ def main(argv: Optional[List[str]] = None) -> None:
 
         # Infer embedding_dim from checkpoint if possible
         def _infer_embedding_dim(state: dict) -> int:
-            for cand in ("embedding.weight", "primitive_embedding.weight"):
+            for cand in (
+                "embedding.weight",
+                "primitive_embedding.weight",
+                "_orig_mod.embedding.weight",
+            ):
                 if cand in state and state[cand].dim() == 2:
                     return int(state[cand].shape[1])
             # Fallback: search any 2D tensor whose first dimension looks like vocab (900..1300)
@@ -570,30 +574,33 @@ def main(argv: Optional[List[str]] = None) -> None:
                 t for t in state.values() if t.dim() == 2 and 900 <= t.shape[0] <= 1300
             ]
             if candidates:
-                # Pick smallest second dim (likely embedding, not classifier hidden)
                 candidates.sort(key=lambda x: x.shape[1])
                 return int(candidates[0].shape[1])
             return 64  # safe default
 
-        # Infer stages from any existing conv weights; fallback to known baseline patterns
+        # Infer CNN stages & blocks from conv weights; fallback to heuristic
         def _infer_cnn_stages(
             state: dict, embed_dim: int
         ) -> tuple[list[int], list[int]]:
-            # Look for stem conv first
+            # Accept both sanitized keys (after _orig_mod removal) or raw prefixed
+            stem_key_candidates = [k for k in state if k.endswith("stem.conv.weight")]
             stem_out = None
-            if "stem.conv.weight" in state and state["stem.conv.weight"].dim() == 4:
-                stem_out = int(state["stem.conv.weight"].shape[0])
-            # Collect residual block out channels
+            for sk in stem_key_candidates:
+                if state[sk].dim() == 4:
+                    stem_out = int(state[sk].shape[0])
+                    break
+
+            # Collect conv1 weights inside residual blocks
             block_channels = []
             for k, v in state.items():
                 if (
-                    k.startswith("features.")
-                    and k.endswith("conv1.conv.weight")
+                    k.endswith("conv1.conv.weight")
+                    and ".features." in k
                     and v.dim() == 4
                 ):
                     block_channels.append(int(v.shape[0]))
+
             if stem_out is not None and block_channels:
-                # Partition when channel count changes
                 stages = [stem_out]
                 counts = [0]
                 for ch in block_channels:
@@ -603,10 +610,25 @@ def main(argv: Optional[List[str]] = None) -> None:
                     else:
                         counts[-1] += 1
                 return stages, counts
-            # Fallback heuristics based on embedding_dim
+
+            # Fallback heuristics based on embedding_dim (capacity vs baseline)
             if embed_dim >= 96:
                 return [96, 192, 256], [3, 3, 3]
             return [64, 128, 192], [2, 2, 2]
+
+        # Infer classifier hidden dim (any Linear whose out_features != num_labels but appears in classifier)
+        def _infer_classifier_hidden_dim(state: dict, num_labels: int | None) -> int:
+            if num_labels is None:
+                num_labels = -1
+            hidden = None
+            for k, v in state.items():
+                if "classifier" in k and k.endswith(".weight") and v.dim() == 2:
+                    out_f, in_f = v.shape
+                    if out_f != num_labels:
+                        # Exclude embedding weights mistakenly matched
+                        hidden = out_f
+                        # Prefer the largest candidate (later layers)
+            return hidden or 0
 
         # Primary load (baseline override or dynamic)
         if args.baseline_phase2:
@@ -632,8 +654,12 @@ def main(argv: Optional[List[str]] = None) -> None:
                         "downsample": "conv",
                         "activation": "gelu",
                         "dropout": 0.1,
-                        "classifier_hidden_dim": 0,
-                        "classifier_dropout": 0.2,
+                        "classifier_hidden_dim": _infer_classifier_hidden_dim(
+                            state, len(inv_labels)
+                        ),
+                        "classifier_dropout": 0.2
+                        if _infer_classifier_hidden_dim(state, len(inv_labels)) == 0
+                        else 0.30,
                     },
                     "init": {
                         "embedding_from_centroids": False,
@@ -683,8 +709,13 @@ def main(argv: Optional[List[str]] = None) -> None:
                                 "downsample": "conv",
                                 "activation": "gelu",
                                 "dropout": 0.1,
-                                "classifier_hidden_dim": 0,
-                                "classifier_dropout": 0.2,
+                                "classifier_hidden_dim": _infer_classifier_hidden_dim(
+                                    state, len(inv_labels)
+                                ),
+                                "classifier_dropout": 0.2
+                                if _infer_classifier_hidden_dim(state, len(inv_labels))
+                                == 0
+                                else 0.30,
                             },
                             "init": {
                                 "embedding_from_centroids": False,
