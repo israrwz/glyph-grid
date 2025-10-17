@@ -529,19 +529,84 @@ def main(argv: Optional[List[str]] = None) -> None:
     else:
         phase2 = None
         missing_after = None
-        # Primary load (either explicit baseline or dynamic)
+
+        # Utility: strip common prefixes from checkpoint keys
+        def _sanitize_state_keys(raw_state: dict) -> dict:
+            cleaned = {}
+            for k, v in raw_state.items():
+                nk = k
+                for prefix in ("model.", "module.", "net."):
+                    if nk.startswith(prefix):
+                        nk = nk[len(prefix) :]
+                cleaned[nk] = v
+            return cleaned
+
+        # Infer embedding_dim from checkpoint if possible
+        def _infer_embedding_dim(state: dict) -> int:
+            for cand in ("embedding.weight", "primitive_embedding.weight"):
+                if cand in state and state[cand].dim() == 2:
+                    return int(state[cand].shape[1])
+            # Fallback: search any 2D tensor whose first dimension looks like vocab (900..1300)
+            candidates = [
+                t for t in state.values() if t.dim() == 2 and 900 <= t.shape[0] <= 1300
+            ]
+            if candidates:
+                # Pick smallest second dim (likely embedding, not classifier hidden)
+                candidates.sort(key=lambda x: x.shape[1])
+                return int(candidates[0].shape[1])
+            return 64  # safe default
+
+        # Infer stages from any existing conv weights; fallback to known baseline patterns
+        def _infer_cnn_stages(
+            state: dict, embed_dim: int
+        ) -> tuple[list[int], list[int]]:
+            # Look for stem conv first
+            stem_out = None
+            if "stem.conv.weight" in state and state["stem.conv.weight"].dim() == 4:
+                stem_out = int(state["stem.conv.weight"].shape[0])
+            # Collect residual block out channels
+            block_channels = []
+            for k, v in state.items():
+                if (
+                    k.startswith("features.")
+                    and k.endswith("conv1.conv.weight")
+                    and v.dim() == 4
+                ):
+                    block_channels.append(int(v.shape[0]))
+            if stem_out is not None and block_channels:
+                # Partition when channel count changes
+                stages = [stem_out]
+                counts = [0]
+                for ch in block_channels:
+                    if ch != stages[-1]:
+                        stages.append(ch)
+                        counts.append(1)
+                    else:
+                        counts[-1] += 1
+                return stages, counts
+            # Fallback heuristics based on embedding_dim
+            if embed_dim >= 96:
+                return [96, 192, 256], [3, 3, 3]
+            return [64, 128, 192], [2, 2, 2]
+
+        # Primary load (baseline override or dynamic)
         if args.baseline_phase2:
+            payload = torch.load(str(args.phase2_ckpt), map_location="cpu")
+            raw_state = payload.get("model_state") or payload
+            state = _sanitize_state_keys(raw_state)
+            emb_dim = _infer_embedding_dim(state)
+            stages, blocks = _infer_cnn_stages(state, emb_dim)
             baseline_cfg = {
                 "input": {
                     "primitive_vocab_size": 1024,
-                    "embedding_dim": 64,
+                    "embedding_dim": emb_dim,
                     "normalize_embeddings": False,
                 },
                 "model": {
                     "architecture": "cnn",
                     "cnn": {
-                        "stages": [64, 128, 192],
-                        "blocks_per_stage": [2, 2, 2],
+                        "stages": stages,
+                        "blocks_per_stage": blocks,
                         "kernel_size": 3,
                         "stem_kernel_size": 3,
                         "stem_stride": 1,
@@ -561,42 +626,38 @@ def main(argv: Optional[List[str]] = None) -> None:
             phase2 = build_phase2_cnn_model(
                 baseline_cfg, num_labels=len(inv_labels), primitive_centroids=None
             )
-            payload = torch.load(str(args.phase2_ckpt), map_location="cpu")
-            state = payload.get("model_state") or payload
+            # Remap state keys to match model
             phase2.load_state_dict(state, strict=False)
             phase2.to(DEVICE).eval()
         else:
-            # Try dynamic loader first
+            # Attempt capacity/dynamic loader first
             phase2 = load_phase2_model(
                 ckpt_path=args.phase2_ckpt,
                 num_labels=len(inv_labels),
                 arch_arg=args.arch,
                 yaml_cfg=yaml_cfg,
             )
-            # Heuristic: if we see a large block of missing CNN weights (e.g., embedding.weight) it likely means
-            # the checkpoint is for the *baseline* architecture but we instantiated the *capacity* CNN.
-            # Auto-retry with baseline spec (unless transformer was explicitly requested).
-            # We infer mismatch if embedding.weight missing and model has attribute 'embedding'.
-            # Suppress second warning after successful fallback.
             try:
-                # Re-load raw payload to inspect keys vs model
                 payload = torch.load(str(args.phase2_ckpt), map_location="cpu")
-                state = payload.get("model_state") or payload
+                raw_state = payload.get("model_state") or payload
+                state = _sanitize_state_keys(raw_state)
                 model_keys = set(phase2.state_dict().keys())
                 missing_after = [k for k in model_keys if k not in state]
                 if "embedding.weight" in missing_after and args.arch != "transformer":
-                    # Suppressed verbose mismatch notice (automatic silent fallback to baseline CNN).
-                    baseline_cfg = {
+                    # Fallback to inferred baseline using checkpoint's actual embedding/stage structure
+                    emb_dim = _infer_embedding_dim(state)
+                    stages, blocks = _infer_cnn_stages(state, emb_dim)
+                    inferred_cfg = {
                         "input": {
                             "primitive_vocab_size": 1024,
-                            "embedding_dim": 64,
+                            "embedding_dim": emb_dim,
                             "normalize_embeddings": False,
                         },
                         "model": {
                             "architecture": "cnn",
                             "cnn": {
-                                "stages": [64, 128, 192],
-                                "blocks_per_stage": [2, 2, 2],
+                                "stages": stages,
+                                "blocks_per_stage": blocks,
                                 "kernel_size": 3,
                                 "stem_kernel_size": 3,
                                 "stem_stride": 1,
@@ -614,13 +675,13 @@ def main(argv: Optional[List[str]] = None) -> None:
                         },
                     }
                     phase2 = build_phase2_cnn_model(
-                        baseline_cfg,
+                        inferred_cfg,
                         num_labels=len(inv_labels),
                         primitive_centroids=None,
                     )
                     phase2.load_state_dict(state, strict=False)
                     phase2.to(DEVICE).eval()
-                    missing_after = None  # suppress warning print below
+                    missing_after = None
             except Exception:
                 pass
 
