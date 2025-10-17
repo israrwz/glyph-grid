@@ -776,10 +776,11 @@ def main(argv: Optional[List[str]] = None) -> None:
                 stem = raster_path.stem
                 input_label = stem.rsplit("_", 1)[0] if "_" in stem else stem
                 input_base = base_unicode_map.get(input_label, "?")
+                # New concise log format:
+                # {input unicode} -> {top match unicode} [top5 unicodes] (filename)
+                top5_bases = ", ".join(bases[: args.topk])
                 print(
-                    f"{raster_path.name}: input_base={input_base} "
-                    f"top1_label={top1_label} top1_base={top1_base} "
-                    f"prob={probs[0]:.4f} | topk={[(l, b, round(p, 4)) for l, b, p in zip(labels, bases, probs)]}",
+                    f"{input_base} -> {top1_base} [{top5_bases}] ({raster_path.name})",
                     flush=True,
                 )
 

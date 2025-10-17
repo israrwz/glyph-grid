@@ -425,16 +425,43 @@ def save_checkpoint(
     epoch: int,
     metrics: Dict[str, Any],
     scheduler: Optional[Any] = None,
+    config: Optional[Dict[str, Any]] = None,
+    label_map: Optional[Dict[str, int]] = None,
 ):
+    """
+    Save a training checkpoint.
+
+    If the model has been compiled with torch.compile, PyTorch wraps the original
+    module under model._orig_mod. To ensure we persist the canonical (uncompiled)
+    parameter names (so inference can reconstruct the architecture without
+    `_orig_mod.` prefixes), we prefer _orig_mod.state_dict() when present.
+
+    Additional metadata (config and label_map) may be embedded for robust
+    reconstruction during inference.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
+
+    # Prefer uncompiled/original module weights if available
+    if hasattr(model, "_orig_mod") and hasattr(
+        getattr(model, "_orig_mod"), "state_dict"
+    ):
+        base_state = model._orig_mod.state_dict()  # type: ignore[attr-defined]
+    else:
+        base_state = model.state_dict()
+
+    payload: Dict[str, Any] = {
         "epoch": epoch,
-        "model_state": model.state_dict(),
+        "model_state": base_state,
         "optimizer_state": optimizer.state_dict(),
         "metrics": metrics,
     }
     if scheduler and hasattr(scheduler, "state_dict"):
         payload["scheduler_state"] = scheduler.state_dict()
+    if config is not None:
+        payload["config"] = config
+    if label_map is not None:
+        payload["label_map"] = label_map
+
     torch.save(payload, path)
 
 
@@ -1428,6 +1455,8 @@ def train_phase2(cfg: Phase2Config):
                     "macro_f1_all": (macro_f1_all or 0.0),
                 },
                 scheduler=scheduler,
+                config=cfg.raw,
+                label_map=label_map,
             )
             # Maintain best.pt symlink (or copy fallback)
             best_link = ckpt_dir / "best.pt"
@@ -1505,6 +1534,8 @@ def train_phase2(cfg: Phase2Config):
                 "test_accuracy_top1": test_stats.get("accuracy_top1", 0.0),
             },
             scheduler=scheduler,
+            config=cfg.raw,
+            label_map=label_map,
         )
         print(f"[CHECKPOINT] Saved last checkpoint to {last_path}", flush=True)
 
