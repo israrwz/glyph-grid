@@ -1,28 +1,15 @@
 # Phase 2 (Glyph Classification) Configuration
-# Aligned strictly with NEW_PLAN.md Sections 7.1–7.3
+# Updated: Increased CNN capacity, adjusted embedding size, switched scheduler to cosine with warmup,
+# earlier unweighting, tuned class weight alpha, and added classifier MLP head.
+# Added commented inference script (bottom) mapping labels to base_unicode via data/chars.csv.
+#
 # Purpose: Classify full glyphs from their 16x16 grid of primitive IDs (0..1023).
-# Pipeline assumption:
-#   - Phase 1 has produced: grids/<glyph_id>.u16 (shape 16x16), primitive_centroids.npy, label_map.json
-#   - Rasterization already applied scaling/diacritic heuristic; grids are row‑major, no cropping.
-#
-# Key Plan Points Incorporated:
-#   - Primitive embedding: Embedding(1024, 64)
-#   - 2D positional encoding (sinusoidal or learnable) added to embeddings
-#   - Transformer: 4–6 layers; choose 5 (midpoint), d_model=256, heads=8, MLP=512, dropout=0.1
-#   - Batch size: 128
-#   - Optimizer: AdamW lr=5e-4
-#   - Epochs: 30–50 → choose 40 baseline
-#   - Regularization: dropout 0.1, label smoothing 0.05
-#   - Optional auxiliary diacritic presence loss (disabled by default, weight=0.1 in plan suggestion)
-#
-# Omitted (not in plan): token masking, advanced sequence augmentations, extra special tokens.
 
 experiment:
-  name: phase2_transformer_baseline_v1
+  name: phase2_cnn_capacity_v2
   notes: >
-    Baseline lightweight transformer on primitive ID grids.
-    Embedding(1024,64) + 2D positional enc + 5-layer encoder (d_model=256).
-    Midpoint hyperparameters of specified plan ranges.
+    Higher-capacity CNN (stages [96,192,256], blocks [3,3,3], embedding_dim=96, classifier_hidden=256),
+    cosine LR schedule (warmup=3, min_lr_scale=0.05), earlier unweighting (epoch 12).
 
 seed: 42
 deterministic: true
@@ -32,59 +19,41 @@ deterministic: true
 # ------------------------------------------------------------------
 data:
   root: data/grids_memmap
-  grids_dir: data/grids_memmap # Memmap root; single packed file instead of per-glyph .u16 files
+  grids_dir: data/grids_memmap
   labels_file: data/grids_memmap/label_map.json
   index_train: data/grids_memmap/splits/phase2_train_ids.txt
   index_val: data/grids_memmap/splits/phase2_val_ids.txt
   index_test: data/grids_memmap/splits/phase2_test_ids.txt
-  primitive_centroids: assets/centroids/primitive_centroids.npy # Can re-enable centroid init after validation
-  # Memmap-specific files:
+  primitive_centroids: assets/centroids/primitive_centroids.npy
   memmap_grids_file: data/grids_memmap/grids_uint16.npy
   memmap_row_ids_file: data/grids_memmap/glyph_row_ids.npy
   glyph_labels_file: data/grids_memmap/glyph_labels.jsonl
-  # Format expectations:
-  #   - label_map.json: { "label_string": class_index, ... } stable sorted order from preprocessing
-  #   - primitive_centroids: produced during K-Means (Section 6.1)
 
 # ------------------------------------------------------------------
-# Input Representation (Section 7.1)
+# Input Representation
 # ------------------------------------------------------------------
 input:
   grid_rows: 16
   grid_cols: 16
-  primitive_vocab_size: 1024 # IDs 0..1023 (0 = EMPTY)
-  embedding_dim: 64
-  positional_encoding: sinusoidal_2d # {sinusoidal_2d | learnable_2d}
-  combine_mode: add # How positional enc is merged with primitive embeddings
+  primitive_vocab_size: 1024
+  embedding_dim: 96
+  positional_encoding: sinusoidal_2d
+  combine_mode: add
   patch_grouping:
-    enabled: true # GPU: enable 4x4 grouping → reduces tokens (256 → 64) for any transformer use
+    enabled: true
     patch_rows: 4
     patch_cols: 4
-  token_pooling: cls # {cls | mean}; plan allows global average OR CLS
-  use_cls_token: true # Adds an extra learnable CLS (sequence len = 256+1)
-  normalize_embeddings: false # L2 normalize embeddings (not in plan; default off)
+  token_pooling: cls
+  use_cls_token: true
+  normalize_embeddings: false
 
 # ------------------------------------------------------------------
-# Model Definition (Section 7.2.A)
+# Model Definition
 # ------------------------------------------------------------------
-# model:
-#   architecture: cnn
-#   # architecture: transformer
-#   cnn:
-#     stages: [64, 128, 192] # or omit to auto-generate
-#     blocks_per_stage: [2, 2, 2]
-#     dropout: 0.1
-#     activation: gelu
-#     kernel_size: 3
-#     stem_kernel_size: 3
-#     stem_stride: 1
-#     downsample: conv
-#     classifier_hidden_dim: 0 # 0 => single linear
-#     classifier_dropout: 0.1
 model:
   architecture: cnn
-  transformer:
-    num_layers: 5 # Plan: 4–6 → picked midpoint
+  transformer: # kept for easy switch; unused when architecture=cnn
+    num_layers: 5
     d_model: 256
     num_heads: 8
     mlp_hidden_dim: 512
@@ -93,72 +62,61 @@ model:
     layer_norm_eps: 1.0e-5
     pre_norm: true
   classifier:
-    hidden_dim: 256 # Single linear if hidden_dim == d_model; can add MLP later
+    hidden_dim: 256
     dropout: 0.1
     activation: gelu
-  # CNN alternative architecture configuration (used when model.architecture: cnn)
   cnn:
-    stages: [64, 128, 192]
-    blocks_per_stage: [2, 2, 2]
+    stages: [96, 192, 256]
+    blocks_per_stage: [3, 3, 3]
     kernel_size: 3
     stem_kernel_size: 3
     stem_stride: 1
     downsample: conv
     activation: gelu
-    dropout: 0.1
-    classifier_hidden_dim: 0 # 0 => single linear head
-    classifier_dropout: 0.2 # Increased from 0.1 (quick win regularization)
+    dropout: 0.15
+    classifier_hidden_dim: 256
+    classifier_dropout: 0.30
   init:
-    embedding_from_centroids: false # Disabled for memmap run; enable after verifying centroids alignment
+    embedding_from_centroids: false
     centroid_requires_grad: true
     cls_init: normal
     weight_init: xavier_uniform
 
 # ------------------------------------------------------------------
-# Optimization & Training (Section 7.3)
+# Optimization & Training
 # ------------------------------------------------------------------
 optim:
   name: adamw
-  lr: 0.0005 # Plan: 5e-4
+  lr: 0.0005
   weight_decay: 1.0e-4
   betas: [0.9, 0.999]
   eps: 1.0e-8
   grad_clip_norm: 1.0
 
 scheduler:
-  strategy: plateau # {cosine | plateau}; plan allows Cosine or ReduceLROnPlateau
-
-  plateau: # Used only if strategy == plateau
-    metric: val/accuracy_top1
-    mode: max
-    factor: 0.5
-    patience: 3
-    min_lr: 1.0e-6
+  strategy: cosine
+  warmup_epochs: 3
+  min_lr_scale: 0.05
 
 training:
-  unweighted_finetune_after_epoch: 19
-  # (REMINDER) At/after this epoch:
-  #   - set loss.class_weights: null
-  #   - remove class_weights_alpha
-  #   - set token_id_dropout: 0
-  #   - optionally reduce LR again if not yet decayed
-  epochs: 40 # Plan: 30–50
-  batch_size: 1024 # GPU: larger batch for higher throughput (adjust if memory constrained)
-  eval_batch_size: 1024 # Match train batch for efficient evaluation
-  num_workers: 2 # Reduced for Kaggle inode/worker limits
-  pin_memory: true # Keep true for faster H2D transfers
+  unweighted_finetune_after_epoch: 12
+  epochs: 40
+  batch_size: 1024
+  eval_batch_size: 1024
+  num_workers: 2
+  pin_memory: true
   gradient_accumulation_steps: 1
-  auto_lr_scale: true # Scale LR by (batch_size / base_batch_size_for_lr) if enabled
-  base_batch_size_for_lr: 256 # Reference batch size for auto LR scaling
-  target_effective_batch_size: 4096 # If > batch_size, gradient accumulation steps are auto-adjusted
-  compile: true # Enable torch.compile (PyTorch 2.x) for graph-level optimization
-  log_interval_steps: 25 # Reduce console overhead with large step counts
-  token_id_dropout: 0.02 # Keep; you can lower to 0 for final fine-tune
+  auto_lr_scale: true
+  base_batch_size_for_lr: 256
+  target_effective_batch_size: 4096
+  compile: true
+  log_interval_steps: 25
+  token_id_dropout: 0.02
   val_interval_epochs: 1
   save_every_epochs: 1
-  mixed_precision: amp # {none | amp} - leverage GPU Tensor Cores
-  cache_grids: true # Preload all grids into RAM (ensure memory headroom)
-  resume_from: checkpoints/phase2/best.pt
+  mixed_precision: amp
+  cache_grids: true
+  resume_from:
 
 early_stopping:
   enabled: true
@@ -173,24 +131,24 @@ early_stopping:
 loss:
   primary: cross_entropy
   label_smoothing: 0.05
-  class_weights: auto_inverse_freq # enabled auto inverse frequency weights
-  class_weights_alpha: 0.3
+  class_weights: auto_inverse_freq
+  class_weights_alpha: 0.2
   auxiliary_diacritic:
-    enabled: false # Optional auxiliary (Section 7.3 table, weight 0.1)
+    enabled: false
     weight: 0.1
-    label_source: metadata # Where to read diacritic flag (metadata boolean)
+    label_source: metadata
   reduction: mean
 
 # ------------------------------------------------------------------
-# Metrics (Section 8.2 subset relevant to phase)
+# Metrics
 # ------------------------------------------------------------------
 metrics:
   - accuracy_top1
   - accuracy_top5
   - macro_f1
   - per_class_accuracy
-  - diacritic_subset_accuracy # accuracy restricted to glyphs is_diacritic=true
-  - ligature_subset_accuracy # if ligatures flagged; else ignore gracefully
+  - diacritic_subset_accuracy
+  - ligature_subset_accuracy
 
 # ------------------------------------------------------------------
 # Checkpointing
@@ -208,14 +166,14 @@ checkpoint:
 # Logging
 # ------------------------------------------------------------------
 logging:
-  backend: tensorboard # {tensorboard | wandb | none}
+  backend: tensorboard
   tensorboard_dir: logs/phase2
   run_name: "${experiment.name}"
   log_hparams: true
   wandb:
     enabled: false
     project: glyph-grid
-    tags: ["phase2", "transformer", "baseline"]
+    tags: ["phase2", "cnn", "capacity"]
 
 # ------------------------------------------------------------------
 # Evaluation / Analysis Hooks
@@ -237,7 +195,7 @@ evaluation:
 sanity:
   expect_grid_shape: [16, 16]
   primitive_vocab_size: 1024
-  embedding_dim: 64
+  embedding_dim: 96
   d_model: 256
   mlp_hidden_dim: 512
   assert_cls_token: true
@@ -254,8 +212,144 @@ debug:
 # ------------------------------------------------------------------
 # Notes
 # ------------------------------------------------------------------
-# - To try patch grouping (4x4→64 tokens), set patch_grouping.enabled: true and
-#   adjust use_cls_token if desired.
-# - If overfitting early, raise dropout to 0.15 or add stochastic depth.
-# - For larger experiments (d_model=320, num_layers=6) adjust batch size or use grad accumulation.
-# - Auxiliary diacritic loss can be enabled once metadata includes robust diacritic subtype flags.
+# Capacity changes: embedding_dim→96, CNN widened/deepened.
+# Earlier unweighted fine-tune to rebalance head classes.
+# Cosine schedule for smoother late convergence.
+
+# ------------------------------------------------------------------
+# Inference Script (Commented)
+# ------------------------------------------------------------------
+# Save the following as scripts/infer_chain.py (example). It maps predicted label -> base_unicode using data/chars.csv.
+# Usage:
+#   python scripts/infer_chain.py --rasters_dir data/rasters --phase1_ckpt checkpoints/phase1/best.pt \
+#       --phase2_ckpt checkpoints/phase2/best.pt --label_map data/grids_memmap/label_map.json --chars_csv data/chars.csv --arch cnn --limit 5
+#
+# ---------------------------------------------------------------
+# import argparse, json, csv
+# from pathlib import Path
+# import torch, numpy as np
+# from PIL import Image
+# from models.phase1_cnn import build_phase1_model
+# from models.phase2_cnn import build_phase2_cnn_model
+# from models.phase2_transformer import build_phase2_model
+#
+# DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#
+# def load_label_map(path: Path):
+#     lm = json.loads(path.read_text(encoding="utf-8"))
+#     inv = [None] * len(lm)
+#     for k,v in lm.items():
+#         inv[v] = k
+#     return lm, inv
+#
+# def load_chars_csv(chars_csv: Path):
+#     # Build mapping label -> base_unicode (first occurrence kept)
+#     mapping = {}
+#     with chars_csv.open("r", encoding="utf-8") as f:
+#         reader = csv.DictReader(f)
+#         for row in reader:
+#             lbl = row["label"]
+#             base = row["base_unicode"]
+#             mapping.setdefault(lbl, base)
+#     return mapping
+#
+# def load_phase1(ckpt: Path):
+#     cfg = {
+#         "in_channels": 1,
+#         "conv_blocks": [
+#             {"out_channels":32,"kernel":3,"stride":1,"padding":1,"batchnorm":True,"pool":2},
+#             {"out_channels":64,"kernel":3,"stride":1,"padding":1,"batchnorm":True,"pool":2},
+#         ],
+#         "flatten_dim":256,"fc_hidden":128,"fc_dropout":0.2,"num_classes":1024,"weight_init":"kaiming_normal"
+#     }
+#     m = build_phase1_model(cfg)
+#     payload = torch.load(str(ckpt), map_location="cpu")
+#     state = payload.get("model_state") or payload
+#     m.load_state_dict(state, strict=False)
+#     return m.to(DEVICE).eval()
+#
+# def build_phase2(ckpt: Path, num_labels: int, arch: str):
+#     payload = torch.load(str(ckpt), map_location="cpu")
+#     cfg_root = payload.get("config", {}) or {}
+#     if arch == "cnn":
+#         cnn_cfg = cfg_root if cfg_root else {
+#             "input":{"primitive_vocab_size":1024,"embedding_dim":96,"normalize_embeddings":False},
+#             "model":{"architecture":"cnn","cnn":{"stages":[96,192,256],"blocks_per_stage":[3,3,3],"kernel_size":3,
+#                      "stem_kernel_size":3,"stem_stride":1,"downsample":"conv","activation":"gelu","dropout":0.15,
+#                      "classifier_hidden_dim":256,"classifier_dropout":0.30},
+#                      "init":{"embedding_from_centroids":False,"centroid_requires_grad":True,"weight_init":"xavier_uniform"}}
+#         }
+#         m = build_phase2_cnn_model(cnn_cfg, num_labels=num_labels, primitive_centroids=None)
+#     else:
+#         tf_cfg = cfg_root if cfg_root else {
+#             "input":{"primitive_vocab_size":1024,"embedding_dim":64,"positional_encoding":"sinusoidal_2d","combine_mode":"add",
+#                      "patch_grouping":{"enabled":True,"patch_rows":4,"patch_cols":4},"token_pooling":"cls","use_cls_token":True,
+#                      "normalize_embeddings":False},
+#             "model":{"architecture":"transformer","transformer":{"num_layers":5,"d_model":256,"num_heads":8,"mlp_hidden_dim":512,
+#                      "dropout":0.1,"attention_dropout":0.1,"layer_norm_eps":1e-5,"pre_norm":True},
+#                      "classifier":{"hidden_dim":256,"dropout":0.1,"activation":"gelu"},
+#                      "init":{"embedding_from_centroids":False,"centroid_requires_grad":True,"weight_init":"xavier_uniform","cls_init":"normal"}}
+#         }
+#         m = build_phase2_model(tf_cfg, num_labels=num_labels, primitive_centroids=None)
+#     state = payload.get("model_state") or payload
+#     m.load_state_dict(state, strict=False)
+#     return m.to(DEVICE).eval()
+#
+# def raster_to_grid(p: Path, phase1):
+#     img = Image.open(p).convert("L")
+#     arr = np.array(img, dtype=np.uint8)
+#     if arr.shape != (128,128):
+#         raise ValueError(f"Expected 128x128 raster; got {arr.shape}")
+#     patches = []
+#     for gy in range(16):
+#         for gx in range(16):
+#             cell = arr[gy*8:(gy+1)*8, gx*8:(gx+1)*8]
+#             t = torch.from_numpy(cell).unsqueeze(0).unsqueeze(0)  # (1,1,8,8)
+#             patches.append(t)
+#     batch = torch.cat(patches, dim=0).to(DEVICE)
+#     with torch.no_grad():
+#         logits = phase1(batch)
+#         preds = torch.argmax(logits, dim=1)
+#     return preds.view(16,16).cpu()
+#
+# def predict_glyph(grid: torch.Tensor, phase2, topk: int):
+#     g = grid.to(torch.long).unsqueeze(0).to(DEVICE)
+#     with torch.no_grad():
+#         logits = phase2(g)
+#         probs = torch.softmax(logits, dim=1)
+#         v,i = torch.topk(probs, k=topk, dim=1)
+#     return i.squeeze(0).cpu(), v.squeeze(0).cpu()
+#
+# def main():
+#     ap = argparse.ArgumentParser()
+#     ap.add_argument("--rasters_dir", type=Path, required=True)
+#     ap.add_argument("--phase1_ckpt", type=Path, required=True)
+#     ap.add_argument("--phase2_ckpt", type=Path, required=True)
+#     ap.add_argument("--label_map", type=Path, required=True)
+#     ap.add_argument("--chars_csv", type=Path, required=True)
+#     ap.add_argument("--arch", type=str, default="cnn", choices=["cnn","transformer"])
+#     ap.add_argument("--limit", type=int, default=10)
+#     ap.add_argument("--topk", type=int, default=5)
+#     args = ap.parse_args()
+#
+#     label_map, inv_labels = load_label_map(args.label_map)
+#     base_map = load_chars_csv(args.chars_csv)  # label -> base_unicode
+#
+#     phase1 = load_phase1(args.phase1_ckpt)
+#     phase2 = build_phase2(args.phase2_ckpt, num_labels=len(label_map), arch=args.arch)
+#
+#     rasters = sorted(p for p in args.rasters_dir.glob("*.png"))
+#     if args.limit > 0:
+#         rasters = rasters[:args.limit]
+#     print(f"[INFO] Inference on {len(rasters)} rasters")
+#     for p in rasters:
+#         grid = raster_to_grid(p, phase1)
+#         idxs, probs = predict_glyph(grid, phase2, topk=args.topk)
+#         labels = [inv_labels[i] for i in idxs.tolist()]
+#         bases = [base_map.get(lbl, "?") for lbl in labels]
+#         top1 = labels[0]
+#         print(f"{p.name}: top1_label={top1} top1_base={bases[0]} prob={probs[0]:.4f} | topk={[ (l,b,round(float(pr),4)) for l,b,pr in zip(labels,bases,probs.tolist()) ]}")
+#     print("[DONE]")
+#
+# if __name__ == "__main__":
+#     main()
