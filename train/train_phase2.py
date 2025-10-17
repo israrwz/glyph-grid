@@ -162,19 +162,24 @@ def set_seed(seed: int, deterministic: bool = True):
 
 class GlyphGridDataset(Dataset):
     """
-    Loads per-glyph primitive ID grids (16x16) and maps to label indices.
+    Loads primitive ID grids (16x16) and maps to label indices.
 
-    File resolution order for each glyph_id:
-      <grids_dir>/<id>.u16  (raw) else <grids_dir>/<id>.npy
+    Modes:
+      1. Per-file mode: <grids_dir>/<glyph_id>.u16 or .npy
+      2. Memmap mode: single packed file grids_uint16.npy (N,16,16) with glyph_row_ids.npy
 
     Args:
-      glyph_ids: list[int] training or validation split.
-      grids_dir: Path to directory with .u16 / .npy grids.
-      label_map: dict label_string -> label_index
+      glyph_ids: list[int] training/validation/test split ids
+      grids_dir: directory root (for per-file) or memmap root
+      label_map: dict label_string -> class index
       glyph_to_label: dict glyph_id -> label_string
-      diacritic_flags: dict glyph_id -> bool (optional)
-      cache: if True, keep small grids in memory (useful if dataset small)
+      diacritic_flags: optional dict glyph_id -> bool
+      cache: if True, cache per-file tensors (not needed for memmap)
+      memmap_grids_file / memmap_row_ids_file: optional explicit paths overriding autodetect
     """
+
+    MEMMAP_GRIDS = "grids_uint16.npy"
+    MEMMAP_ROW_IDS = "glyph_row_ids.npy"
 
     def __init__(
         self,
@@ -185,6 +190,8 @@ class GlyphGridDataset(Dataset):
         diacritic_flags: Optional[Dict[int, bool]] = None,
         cache: bool = False,
         cast_dtype: torch.dtype = torch.int64,
+        memmap_grids_file: Optional[Path] = None,
+        memmap_row_ids_file: Optional[Path] = None,
     ):
         self.glyph_ids = glyph_ids
         self.grids_dir = grids_dir
@@ -195,16 +202,42 @@ class GlyphGridDataset(Dataset):
         self.cast_dtype = cast_dtype
         self._cache: Dict[int, torch.Tensor] = {}
 
+        # Memmap detection
+        self._memmap_mode = False
+        mm_grid_path = memmap_grids_file or (grids_dir / self.MEMMAP_GRIDS)
+        mm_row_ids_path = memmap_row_ids_file or (grids_dir / self.MEMMAP_ROW_IDS)
+        if mm_grid_path.exists() and mm_row_ids_path.exists():
+            row_ids = np.load(mm_row_ids_path)
+            mm = np.memmap(mm_grid_path, dtype=np.uint16, mode="r")
+            if mm.size % 256 != 0:
+                raise RuntimeError(f"Memmap size not divisible by 256: {mm.size}")
+            total = mm.size // 256
+            mm = mm.reshape(total, 16, 16)
+            if len(row_ids) != total:
+                raise RuntimeError("row_ids length mismatch memmap shape.")
+            self._memmap_mode = True
+            self._mm = mm
+            self._id_to_pos = {int(row_ids[i]): i for i in range(len(row_ids))}
+
         missing = [gid for gid in self.glyph_ids if gid not in self.glyph_to_label]
         if missing:
-            # Skip silently? For now we remove them while warning.
             print(
-                f"[warn] {len(missing)} glyph_ids missing label mapping; they will be skipped.",
+                f"[warn] {len(missing)} glyph_ids missing label mapping; skipped.",
                 file=sys.stderr,
             )
             self.glyph_ids = [
                 gid for gid in self.glyph_ids if gid in self.glyph_to_label
             ]
+
+        if self._memmap_mode:
+            filtered = [gid for gid in self.glyph_ids if gid in self._id_to_pos]
+            dropped = len(self.glyph_ids) - len(filtered)
+            if dropped:
+                print(
+                    f"[warn] {dropped} glyph_ids not present in memmap index; dropped.",
+                    file=sys.stderr,
+                )
+            self.glyph_ids = filtered
 
         if len(self.glyph_ids) == 0:
             raise RuntimeError("GlyphGridDataset has zero usable glyph ids.")
@@ -215,14 +248,10 @@ class GlyphGridDataset(Dataset):
     def _load_grid_u16(self, path: Path) -> np.ndarray:
         raw = np.fromfile(path, dtype=np.uint16)
         if raw.size != 256:
-            raise ValueError(
-                f"Corrupt .u16 grid {path} (expected 256 values, got {raw.size})"
-            )
+            raise ValueError(f"Corrupt .u16 grid {path} size={raw.size}")
         return raw.reshape(16, 16)
 
-    def _load_grid(self, gid: int) -> torch.Tensor:
-        if self.cache_enabled and gid in self._cache:
-            return self._cache[gid]
+    def _load_grid_file(self, gid: int) -> torch.Tensor:
         u16_path = self.grids_dir / f"{gid}.u16"
         npy_path = self.grids_dir / f"{gid}.npy"
         if u16_path.exists():
@@ -233,8 +262,24 @@ class GlyphGridDataset(Dataset):
                 raise ValueError(f"Grid shape mismatch {npy_path}: {arr.shape}")
             arr = arr.astype(np.uint16)
         else:
-            raise FileNotFoundError(f"No grid file found for glyph_id={gid}")
-        t = torch.from_numpy(arr.astype("int64"))
+            raise FileNotFoundError(f"No grid file for glyph_id={gid}")
+        return torch.from_numpy(arr.astype("int64"))
+
+    def _load_grid_memmap(self, gid: int) -> torch.Tensor:
+        pos = self._id_to_pos.get(gid)
+        if pos is None:
+            raise KeyError(f"glyph_id {gid} not found in memmap index.")
+        arr = self._mm[pos]
+        return torch.from_numpy(arr.astype("int64"))
+
+    def _load_grid(self, gid: int) -> torch.Tensor:
+        if self.cache_enabled and gid in self._cache:
+            return self._cache[gid]
+        t = (
+            self._load_grid_memmap(gid)
+            if self._memmap_mode
+            else self._load_grid_file(gid)
+        )
         if self.cache_enabled:
             self._cache[gid] = t
         return t
@@ -243,13 +288,13 @@ class GlyphGridDataset(Dataset):
         gid = self.glyph_ids[idx]
         label_str = self.glyph_to_label.get(gid)
         if label_str is None:
-            raise KeyError(f"Missing label string for glyph_id={gid}")
+            raise KeyError(f"Missing label for glyph_id={gid}")
         label_idx = self.label_map.get(label_str)
         if label_idx is None:
             raise KeyError(
                 f"Label '{label_str}' not found in label_map.json (glyph_id={gid})"
             )
-        grid = self._load_grid(gid)  # (16,16) int64
+        grid = self._load_grid(gid)
         return (
             grid.to(self.cast_dtype),
             label_idx,
@@ -602,7 +647,14 @@ def train_phase2(cfg: Phase2Config):
     index_val = Path(data_cfg.get("index_val", splits_root / "phase2_val_ids.txt"))
     index_test = Path(data_cfg.get("index_test", splits_root / "phase2_test_ids.txt"))
 
-    metadata_path = Path("data/rasters/metadata.jsonl")  # assumption
+    metadata_override = data_cfg.get("glyph_labels_file") or data_cfg.get(
+        "metadata_path"
+    )
+    metadata_path = (
+        Path(metadata_override)
+        if metadata_override
+        else Path("data/rasters/metadata.jsonl")
+    )
 
     if not label_map_path.exists():
         raise FileNotFoundError(f"Label map not found: {label_map_path}")
@@ -667,13 +719,24 @@ def train_phase2(cfg: Phase2Config):
         cfg.get("metrics", default=[]) or []
     )
 
+    memmap_grids_file = Path(
+        data_cfg.get("memmap_grids_file", grids_dir / "grids_uint16.npy")
+    )
+    memmap_row_ids_file = Path(
+        data_cfg.get("memmap_row_ids_file", grids_dir / "glyph_row_ids.npy")
+    )
+
     train_ds = GlyphGridDataset(
         train_ids,
         grids_dir,
         label_map,
         glyph_to_label,
         diacritic_flags if track_diacritic else None,
-        cache=cache_grids,
+        cache=False,
+        memmap_grids_file=memmap_grids_file if memmap_grids_file.exists() else None,
+        memmap_row_ids_file=memmap_row_ids_file
+        if memmap_row_ids_file.exists()
+        else None,
     )
     val_ds = GlyphGridDataset(
         val_ids,
@@ -681,7 +744,11 @@ def train_phase2(cfg: Phase2Config):
         label_map,
         glyph_to_label,
         diacritic_flags if track_diacritic else None,
-        cache=cache_grids,
+        cache=False,
+        memmap_grids_file=memmap_grids_file if memmap_grids_file.exists() else None,
+        memmap_row_ids_file=memmap_row_ids_file
+        if memmap_row_ids_file.exists()
+        else None,
     )
     test_ds = GlyphGridDataset(
         test_ids,
@@ -689,7 +756,11 @@ def train_phase2(cfg: Phase2Config):
         label_map,
         glyph_to_label,
         diacritic_flags if track_diacritic else None,
-        cache=cache_grids,
+        cache=False,
+        memmap_grids_file=memmap_grids_file if memmap_grids_file.exists() else None,
+        memmap_row_ids_file=memmap_row_ids_file
+        if memmap_row_ids_file.exists()
+        else None,
     )
 
     # Local collate removed; using top-level collate_grids for multiprocessing safety.

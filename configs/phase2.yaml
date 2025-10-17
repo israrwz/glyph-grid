@@ -31,13 +31,17 @@ deterministic: true
 # Data Paths
 # ------------------------------------------------------------------
 data:
-  root: data/processed
-  grids_dir: data/processed/grids # Each file: <glyph_id>.u16 (16x16, dtype=uint16 or uint16-cast)
-  labels_file: data/processed/label_map.json
-  index_train: data/processed/splits/phase2_train_ids.txt # List of glyph_ids
-  index_val: data/processed/splits/phase2_val_ids.txt
-  index_test: data/processed/splits/phase2_test_ids.txt
-  primitive_centroids: assets/centroids/primitive_centroids.npy # Shape: (1023,64) excluding empty or (1024,64) including empty (validate)
+  root: data/grids_memmap
+  grids_dir: data/grids_memmap # Memmap root; single packed file instead of per-glyph .u16 files
+  labels_file: data/grids_memmap/label_map.json
+  index_train: data/grids_memmap/splits/phase2_train_ids.txt
+  index_val: data/grids_memmap/splits/phase2_val_ids.txt
+  index_test: data/grids_memmap/splits/phase2_test_ids.txt
+  primitive_centroids: assets/centroids/primitive_centroids.npy # Can re-enable centroid init after validation
+  # Memmap-specific files:
+  memmap_grids_file: data/grids_memmap/grids_uint16.npy
+  memmap_row_ids_file: data/grids_memmap/glyph_row_ids.npy
+  glyph_labels_file: data/grids_memmap/glyph_labels.jsonl
   # Format expectations:
   #   - label_map.json: { "label_string": class_index, ... } stable sorted order from preprocessing
   #   - primitive_centroids: produced during K-Means (Section 6.1)
@@ -105,7 +109,7 @@ model:
     classifier_hidden_dim: 0 # 0 => single linear head
     classifier_dropout: 0.2 # Increased from 0.1 (quick win regularization)
   init:
-    embedding_from_centroids: true # Initialize primitive embeddings from centroids (row 0 for EMPTY as zeros)
+    embedding_from_centroids: false # Disabled for memmap run; enable after verifying centroids alignment
     centroid_requires_grad: true
     cls_init: normal
     weight_init: xavier_uniform
