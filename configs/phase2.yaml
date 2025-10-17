@@ -145,7 +145,7 @@ training:
   epochs: 40 # Plan: 30–50
   batch_size: 1024 # GPU: larger batch for higher throughput (adjust if memory constrained)
   eval_batch_size: 1024 # Match train batch for efficient evaluation
-  num_workers: 8 # Increase data loading parallelism on GPU host
+  num_workers: 2 # Reduced for Kaggle inode/worker limits
   pin_memory: true # Keep true for faster H2D transfers
   gradient_accumulation_steps: 1
   auto_lr_scale: true # Scale LR by (batch_size / base_batch_size_for_lr) if enabled

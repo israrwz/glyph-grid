@@ -1424,7 +1424,8 @@ def train_phase2(cfg: Phase2Config):
                 {
                     "val_accuracy_top1": val_stats["accuracy_top1"],
                     "val_loss": val_stats["loss"],
-                    "macro_f1": macro_f1,
+                    "macro_f1_seen": (macro_f1_seen or 0.0),
+                    "macro_f1_all": (macro_f1_all or 0.0),
                 },
                 scheduler=scheduler,
             )
