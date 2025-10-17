@@ -61,6 +61,13 @@ import torch
 from torch import nn
 
 # Project-local imports (factories)
+import os, sys
+
+# Add repo root to sys.path so "models" package resolves even when script is run from a nested working directory (e.g., Kaggle).
+repo_root = Path(__file__).resolve().parents[1]
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
+
 from models.phase1_cnn import build_phase1_model
 from models.phase2_cnn import build_phase2_cnn_model
 from models.phase2_transformer import build_phase2_model
