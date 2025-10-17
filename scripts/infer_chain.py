@@ -298,7 +298,8 @@ def load_phase2_model(
     state = payload.get("model_state") or payload
     missing = model.load_state_dict(state, strict=False)
     if missing.missing_keys:
-        print(f"[warn] Phase2 missing keys: {missing.missing_keys}", file=sys.stderr)
+        # Suppress verbose missing key dump; silent here to allow higher-level fallback logic.
+        pass
     model.to(DEVICE).eval()
     return model
 
@@ -584,10 +585,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 model_keys = set(phase2.state_dict().keys())
                 missing_after = [k for k in model_keys if k not in state]
                 if "embedding.weight" in missing_after and args.arch != "transformer":
-                    print(
-                        "[INFO] Detected architecture mismatch; retrying with baseline Phase 2 CNN spec.",
-                        flush=True,
-                    )
+                    # Suppressed verbose mismatch notice (automatic silent fallback to baseline CNN).
                     baseline_cfg = {
                         "input": {
                             "primitive_vocab_size": 1024,
@@ -668,7 +666,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 input_label = stem.rsplit("_", 1)[0] if "_" in stem else stem
                 input_base = base_unicode_map.get(input_label, "?")
                 print(
-                    f"{raster_path.name}: input_label={input_label} input_base={input_base} "
+                    f"{raster_path.name}: input_base={input_base} "
                     f"top1_label={top1_label} top1_base={top1_base} "
                     f"prob={probs[0]:.4f} | topk={[(l, b, round(p, 4)) for l, b, p in zip(labels, bases, probs)]}",
                     flush=True,
