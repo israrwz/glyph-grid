@@ -286,20 +286,141 @@ def load_phase2_model(
     yaml_cfg: Dict[str, Any],
 ) -> nn.Module:
     """
-    Build model (from YAML if provided) then load weights.
+    Build model (from YAML if provided, else embedded checkpoint config, else fallback)
+    then load weights. Supports both original capacity config and phase2_light variant.
+
+    Precedence:
+      1. --config_yaml (yaml_cfg arg)
+      2. Embedded checkpoint payload["config"]
+      3. Fallback heuristic (arch_arg or default cnn)
     """
-    arch = infer_arch_arg_or_yaml(arch_arg, yaml_cfg)
-    if yaml_cfg:
-        model = build_phase2_from_yaml(yaml_cfg, num_labels)
+    payload = torch.load(str(ckpt_path), map_location="cpu")
+    embedded_cfg = payload.get("config") or {}
+    # Merge: yaml overrides embedded (shallow)
+    merged_cfg: Dict[str, Any] = {}
+    if embedded_cfg and isinstance(embedded_cfg, dict):
+        merged_cfg = embedded_cfg.copy()
+    if yaml_cfg and isinstance(yaml_cfg, dict):
+        # Shallow key override
+        for k, v in yaml_cfg.items():
+            if (
+                isinstance(v, dict)
+                and k in merged_cfg
+                and isinstance(merged_cfg[k], dict)
+            ):
+                # Second-level override (model/input/etc.)
+                merged_cfg[k] = {**merged_cfg[k], **v}
+            else:
+                merged_cfg[k] = v
+
+    use_cfg = merged_cfg if merged_cfg else yaml_cfg
+    arch = infer_arch_arg_or_yaml(
+        arch_arg, use_cfg if isinstance(use_cfg, dict) else {}
+    )
+
+    if use_cfg:
+        try:
+            model = build_phase2_from_yaml(use_cfg, num_labels)
+        except Exception as e:
+            print(
+                f"[warn] Failed building Phase2 from merged config ({e}); using fallback.",
+                file=sys.stderr,
+            )
+            model = build_phase2_fallback(arch, num_labels)
     else:
         model = build_phase2_fallback(arch, num_labels)
 
-    payload = torch.load(str(ckpt_path), map_location="cpu")
     state = payload.get("model_state") or payload
-    missing = model.load_state_dict(state, strict=False)
-    if missing.missing_keys:
-        # Suppress verbose missing key dump; silent here to allow higher-level fallback logic.
-        pass
+    load_result = model.load_state_dict(state, strict=False)
+    if load_result.missing_keys:
+        # Attempt adaptive rebuild for CNN width/block mismatches (e.g., light vs capacity)
+        if arch == "cnn":
+            # Infer embedding/stages from state
+            def _infer_embed(state_dict: dict) -> int:
+                for k, v in state_dict.items():
+                    if k.endswith("embedding.weight") and v.dim() == 2:
+                        return v.shape[1]
+                return int(model.embedding.weight.shape[1])  # fallback to current
+
+            def _infer_stages(state_dict: dict) -> tuple[list[int], list[int]]:
+                stem = None
+                for k, v in state_dict.items():
+                    if k.endswith("stem.conv.weight") and v.dim() == 4:
+                        stem = v.shape[0]
+                        break
+                block_channels = []
+                for k, v in state_dict.items():
+                    if (
+                        "features" in k
+                        and k.endswith("conv1.conv.weight")
+                        and v.dim() == 4
+                    ):
+                        block_channels.append(v.shape[0])
+                if stem and block_channels:
+                    stages = [stem]
+                    counts = [0]
+                    for ch in block_channels:
+                        if ch != stages[-1]:
+                            stages.append(ch)
+                            counts.append(1)
+                        else:
+                            counts[-1] += 1
+                    return stages, counts
+                # Heuristic fallback
+                embed_dim = _infer_embed(state_dict)
+                if embed_dim >= 96:
+                    return [96, 192, 256], [3, 3, 3]
+                return [64, 128, 192], [2, 2, 2]
+
+            try:
+                stages, blocks = _infer_stages(state)
+                embed_dim = _infer_embed(state)
+                hidden_dim = (
+                    256  # preserve classifier_hidden_dim for both capacity & light
+                )
+                inferred_cfg = {
+                    "input": {
+                        "primitive_vocab_size": 1024,
+                        "embedding_dim": embed_dim,
+                        "normalize_embeddings": False,
+                    },
+                    "model": {
+                        "architecture": "cnn",
+                        "cnn": {
+                            "stages": stages,
+                            "blocks_per_stage": blocks,
+                            "kernel_size": 3,
+                            "stem_kernel_size": 3,
+                            "stem_stride": 1,
+                            "downsample": "conv",
+                            "activation": "gelu",
+                            "dropout": 0.10 if stages[0] == 64 else 0.15,
+                            "classifier_hidden_dim": hidden_dim,
+                            "classifier_dropout": 0.25 if stages[0] == 64 else 0.30,
+                        },
+                        "init": {
+                            "embedding_from_centroids": False,
+                            "centroid_requires_grad": True,
+                            "weight_init": "xavier_uniform",
+                            "cls_init": "normal",
+                        },
+                        "classifier": {
+                            "hidden_dim": hidden_dim,
+                            "dropout": 0.15 if stages[0] == 64 else 0.30,
+                            "activation": "gelu",
+                        },
+                    },
+                }
+                model = build_phase2_cnn_model(
+                    inferred_cfg, num_labels=num_labels, primitive_centroids=None
+                )
+                model.load_state_dict(state, strict=False)
+                print(
+                    "[INFO] Rebuilt Phase2 CNN adaptively (light/capacity reconciliation).",
+                    flush=True,
+                )
+            except Exception as e:
+                print(f"[warn] Adaptive rebuild failed: {e}", file=sys.stderr)
     model.to(DEVICE).eval()
     return model
 
@@ -572,7 +693,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                     "downsample": "conv",
                     "activation": "gelu",
                     "dropout": 0.1,
-                    "classifier_hidden_dim": 0,
+                    "classifier_hidden_dim": 256,
                     "classifier_dropout": 0.2,
                 },
                 "init": {
