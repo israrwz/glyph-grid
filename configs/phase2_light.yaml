@@ -1,0 +1,277 @@
+# Phase 2 (Glyph Classification) – Lightweight CNN Variant
+# File: phase2_light.yaml
+#
+# Purpose:
+#   A downsized Phase 2 model maintaining the classifier hidden MLP layer (`classifier_hidden_dim=256`)
+#   while reducing trunk width/depth and embedding size for faster inference and lower memory.
+#
+# Key Changes vs phase2.yaml (capacity_v2):
+#   - embedding_dim: 96 -> 64
+#   - cnn stages: [96,192,256] -> [64,128,192]
+#   - blocks_per_stage: [3,3,3] -> [2,2,2]
+#   - conv dropout: 0.15 -> 0.10
+#   - classifier_dropout: 0.30 -> 0.25
+#   - activation retained (gelu) for parity; can switch to relu for extra CPU speed.
+#
+# Parameter Count (Approximate, All Trainable):
+#   Embedding: vocab_size(1024) * emb_dim(64) = 65,536
+#   Stem Conv + BN: (64*64*3*3)=36,864 + BN(64+64)=128 → 36,992
+#   Stage0 (2 residual blocks @64 ch):
+#       Each block: 2 * (64*64*3*3 + BN(64+64)) = 2 * (36,864 + 128) = 73,984
+#       Two blocks: 147,968
+#   Downsample 64→128: 128*64*3*3=73,728 + BN(128+128)=256 → 73,984
+#   Stage1 (2 blocks @128 ch):
+#       Each block: 2 * (128*128*3*3 + BN(128+128)) = 2 * (147,456 + 256) = 295,424
+#       Two blocks: 590,848
+#   Downsample 128→192: 192*128*3*3=221,184 + BN(192+192)=384 → 221,568
+#   Stage2 (2 blocks @192 ch):
+#       Each block: 2 * (192*192*3*3 + BN(192+192)) = 2 * (331,776 + 384) = 664,320
+#       Two blocks: 1,328,640
+#   Conv trunk total: 2,400,000
+#   Embedding + trunk: 2,465,536
+#   Classifier Head:
+#       LayerNorm(192): 192 + 192 = 384
+#       Linear 192→256: 192*256=49,152 + bias 256 = 49,408
+#       Linear 256→1216: 256*1216=311,296 + bias 1,216 = 312,512
+#       Head total: 362,304
+#   Grand Total ≈ 2,827,840 parameters (≈2.83M)
+#
+# Expected Effects:
+#   - ~60% reduction vs original ~7.20M param model.
+#   - Latency reduction (conv layers narrower + fewer residual blocks).
+#   - Retains nonlinear classifier head for fine-grained decision boundaries over 1216 classes.
+#
+# Recommendations:
+#   - Evaluate accuracy drop; if ≤5% absolute Top-1, proceed.
+#   - If further shrinking needed, next steps: remove classifier hidden layer OR switch residual blocks to depthwise separable.
+#   - Consider later distillation from the larger teacher for recovery.
+#
+# ------------------------------------------------------------------
+# Experiment Meta
+# ------------------------------------------------------------------
+experiment:
+  name: phase2_cnn_light_v1
+  notes: >
+    Lightweight CNN: embedding_dim=64, stages=[64,128,192], blocks=[2,2,2],
+    classifier_hidden_dim=256 preserved. Target ≈2.83M params for faster inference.
+
+seed: 42
+deterministic: true
+
+# ------------------------------------------------------------------
+# Data Paths
+# ------------------------------------------------------------------
+data:
+  root: data/grids_memmap
+  grids_dir: data/grids_memmap
+  labels_file: data/grids_memmap/label_map.json
+  index_train: data/grids_memmap/splits/phase2_train_ids.txt
+  index_val: data/grids_memmap/splits/phase2_val_ids.txt
+  index_test: data/grids_memmap/splits/phase2_test_ids.txt
+  primitive_centroids: assets/centroids/primitive_centroids.npy
+  memmap_grids_file: data/grids_memmap/grids_uint16.npy
+  memmap_row_ids_file: data/grids_memmap/glyph_row_ids.npy
+  glyph_labels_file: data/grids_memmap/glyph_labels.jsonl
+
+# ------------------------------------------------------------------
+# Input Representation
+# ------------------------------------------------------------------
+input:
+  grid_rows: 16
+  grid_cols: 16
+  primitive_vocab_size: 1024
+  embedding_dim: 64             # Reduced from 96
+  positional_encoding: sinusoidal_2d
+  combine_mode: add
+  patch_grouping:
+    enabled: true
+    patch_rows: 4
+    patch_cols: 4
+  token_pooling: cls
+  use_cls_token: true
+  normalize_embeddings: false
+
+# ------------------------------------------------------------------
+# Model Definition
+# ------------------------------------------------------------------
+model:
+  architecture: cnn
+  transformer:  # (unused here; kept for easy switch)
+    num_layers: 5
+    d_model: 256
+    num_heads: 8
+    mlp_hidden_dim: 512
+    dropout: 0.1
+    attention_dropout: 0.1
+    layer_norm_eps: 1.0e-5
+    pre_norm: true
+  classifier:
+    hidden_dim: 256           # Kept (do not set to 0)
+    dropout: 0.15             # Slightly reduced vs 0.30 in capacity config
+    activation: gelu
+  cnn:
+    stages: [64, 128, 192]    # Narrower widths
+    blocks_per_stage: [2, 2, 2]
+    kernel_size: 3
+    stem_kernel_size: 3
+    stem_stride: 1
+    downsample: conv
+    activation: gelu
+    dropout: 0.10             # Lower trunk dropout for smaller model stability
+    classifier_hidden_dim: 256
+    classifier_dropout: 0.25
+  init:
+    embedding_from_centroids: false
+    centroid_requires_grad: true
+    cls_init: normal
+    weight_init: xavier_uniform
+
+# ------------------------------------------------------------------
+# Optimization & Training
+# ------------------------------------------------------------------
+optim:
+  name: adamw
+  lr: 0.0006                  # Slightly higher LR to encourage convergence with fewer params
+  weight_decay: 1.0e-4
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  grad_clip_norm: 1.0
+
+scheduler:
+  strategy: cosine
+  warmup_epochs: 3
+  min_lr_scale: 0.05
+
+training:
+  unweighted_finetune_after_epoch: 12
+  epochs: 45                  # +5 epochs to offset reduced capacity
+  batch_size: 1024
+  eval_batch_size: 1024
+  num_workers: 2
+  pin_memory: true
+  gradient_accumulation_steps: 1
+  auto_lr_scale: true
+  base_batch_size_for_lr: 256
+  target_effective_batch_size: 4096
+  compile: true
+  log_interval_steps: 25
+  token_id_dropout: 0.02
+  val_interval_epochs: 1
+  save_every_epochs: 1
+  mixed_precision: amp
+  cache_grids: true
+  resume_from:
+
+early_stopping:
+  enabled: true
+  metric: val/accuracy_top1
+  mode: max
+  patience: 7                 # Slightly increased due to added epochs
+  min_delta: 0.0005
+
+# ------------------------------------------------------------------
+# Loss Configuration
+# ------------------------------------------------------------------
+loss:
+  primary: cross_entropy
+  label_smoothing: 0.05
+  class_weights: auto_inverse_freq
+  class_weights_alpha: 0.2
+  auxiliary_diacritic:
+    enabled: false
+    weight: 0.1
+    label_source: metadata
+  reduction: mean
+
+# ------------------------------------------------------------------
+# Metrics
+# ------------------------------------------------------------------
+metrics:
+  - accuracy_top1
+  - accuracy_top5
+  - macro_f1
+  - per_class_accuracy
+  - diacritic_subset_accuracy
+  - ligature_subset_accuracy
+
+# ------------------------------------------------------------------
+# Checkpointing
+# ------------------------------------------------------------------
+checkpoint:
+  dir: checkpoints/phase2_light
+  monitor: val/accuracy_top1
+  mode: max
+  save_top_k: 3
+  save_last: true
+  filename_pattern: "epoch{epoch:02d}-val{val_accuracy_top1:.4f}-light.pt"
+  keep_every_n_epochs: 0
+
+# ------------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------------
+logging:
+  backend: tensorboard
+  tensorboard_dir: logs/phase2_light
+  run_name: "${experiment.name}"
+  log_hparams: true
+  wandb:
+    enabled: false
+    project: glyph-grid
+    tags: ["phase2", "cnn", "light", "embedding64"]
+
+# ------------------------------------------------------------------
+# Evaluation / Analysis Hooks
+# ------------------------------------------------------------------
+evaluation:
+  confusion_matrix: true
+  topk: [1, 5]
+  attention_heatmap:
+    enabled: true
+    sample_count: 50
+  export_embeddings:
+    enabled: false
+    layer: penultimate
+    path: artifacts/phase2_light_embeddings.npy
+
+# ------------------------------------------------------------------
+# Sanity & Validation
+# ------------------------------------------------------------------
+sanity:
+  expect_grid_shape: [16, 16]
+  primitive_vocab_size: 1024
+  embedding_dim: 64
+  d_model: 256
+  mlp_hidden_dim: 512
+  assert_cls_token: true
+
+# ------------------------------------------------------------------
+# Debug
+# ------------------------------------------------------------------
+debug:
+  fast_dev_run: false
+  limit_train_batches: null
+  limit_val_batches: null
+  overfit_batches: 0
+  deterministic_hash_check: false
+
+# ------------------------------------------------------------------
+# Notes
+# ------------------------------------------------------------------
+# - This light variant aims for ~2.83M params (vs ~7.2M baseline).
+# - If accuracy drop >5% absolute, consider re-adding one block per stage (e.g., [3,2,2]) or enabling centroid-based embedding init.
+# - Distillation from the capacity model can recover lost performance without increasing size.
+# - Activation can be switched to 'relu' for minor additional inference speed (especially on CPU) at small potential accuracy cost.
+
+# ------------------------------------------------------------------
+# Param Count Assertion (Optional Manual Check)
+# ------------------------------------------------------------------
+# Expected total ≈ 2,827,840 parameters. After training script builds the model,
+# you can programmatically verify:
+#   from models.phase2_cnn import build_phase2_cnn_model
+#   import yaml, json
+#   cfg = yaml.safe_load(open("configs/phase2_light.yaml"))
+#   lm = json.load(open("data/processed/label_map.json"))
+#   m = build_phase2_cnn_model(cfg, num_labels=len(lm), primitive_centroids=None)
+#   print(sum(p.numel() for p in m.parameters()))
+#
+# (Adjust path if label_map differs; ensures reproducibility.)
