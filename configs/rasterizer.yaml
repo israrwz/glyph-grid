@@ -62,6 +62,11 @@ metadata:
   image_format: png # PNG binary (0/255)
   compression: 6
 
+split:
+  train_ratio: 0.86
+  val_ratio: 0.10
+  test_ratio: 0.04
+
 validation:
   strict_bbox: false # Plan does not mandate bbox rejection thresholds
   require_nonempty_contours: true
