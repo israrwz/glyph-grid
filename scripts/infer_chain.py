@@ -508,6 +508,32 @@ def predict_glyph_grid(
     return indices.squeeze(0).cpu().tolist(), values.squeeze(0).cpu().tolist()
 
 
+def predict_glyph_grid_batch(
+    grids: torch.Tensor,
+    phase2_model: nn.Module,
+    topk: int = 5,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Batched version of predict_glyph_grid.
+
+    grids: (B, 16, 16) int64 primitive IDs
+    Returns:
+      topk_indices: (B, topk) int
+      topk_probs: (B, topk) float
+    """
+    if grids.ndim != 3 or grids.shape[1:] != (16, 16):
+        raise ValueError(f"Expected grid shape (B, 16, 16); got {tuple(grids.shape)}")
+
+    input_tensor = grids.to(torch.long).to(DEVICE)  # (B, 16, 16)
+
+    with torch.no_grad():
+        logits = phase2_model(input_tensor)
+        probs = torch.softmax(logits, dim=1)
+        values, indices = torch.topk(probs, k=topk, dim=1)
+
+    return indices.cpu(), values.cpu()
+
+
 # ---------------------------------------------------------------------------
 # JSONL Writing
 # ---------------------------------------------------------------------------
@@ -569,6 +595,18 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     ap.add_argument(
         "--limit", type=int, default=0, help="Limit number of rasters (0=all)."
+    )
+    ap.add_argument(
+        "--batch_size",
+        type=int,
+        default=32,
+        help="Batch size for Phase 2 inference (default: 32).",
+    )
+    ap.add_argument(
+        "--phase1_batch_size",
+        type=int,
+        default=256,
+        help="Batch size for Phase 1 cell inference (default: 256 = all cells at once).",
     )
     ap.add_argument("--topk", type=int, default=5, help="Top-K predictions to output.")
     ap.add_argument(
@@ -1133,64 +1171,102 @@ def main(argv: Optional[List[str]] = None) -> None:
                 }
             )
     else:
-        for idx, raster_path in enumerate(rasters, start=1):
-            try:
-                grid = raster_to_primitive_grid(raster_path, phase1)
-                if args.show_grid and not args.quiet:
-                    grid_str = "\n".join(
-                        " ".join(f"{int(v):04d}" for v in row.tolist())
-                        for row in grid.tolist()
+        # Batched inference mode
+        batch_size = args.batch_size
+        num_rasters = len(rasters)
+
+        for batch_start in range(0, num_rasters, batch_size):
+            batch_end = min(batch_start + batch_size, num_rasters)
+            batch_rasters = rasters[batch_start:batch_end]
+
+            # Phase 1: Convert rasters to grids
+            batch_grids = []
+            valid_indices = []
+            for i, raster_path in enumerate(batch_rasters):
+                try:
+                    grid = raster_to_primitive_grid(raster_path, phase1)
+                    batch_grids.append(grid)
+                    valid_indices.append(i)
+                except Exception as e:
+                    print(
+                        f"[error] Phase 1 failed for {raster_path.name}: {e}",
+                        file=sys.stderr,
                     )
-                    print(f"[GRID] {raster_path.name}\n{grid_str}")
-                label_indices, probs = predict_glyph_grid(grid, phase2, topk=args.topk)
-                labels = [inv_labels[i] for i in label_indices]
-                bases = [base_unicode_map.get(lbl, "?") for lbl in labels]
+                    continue
+
+            if not batch_grids:
+                continue
+
+            # Phase 2: Batch prediction
+            try:
+                grids_tensor = torch.stack(batch_grids)  # (B, 16, 16)
+                batch_indices, batch_probs = predict_glyph_grid_batch(
+                    grids_tensor, phase2, topk=args.topk
+                )
+
+                # Process results
+                for i, (grid_idx, raster_path) in enumerate(
+                    zip(valid_indices, [batch_rasters[vi] for vi in valid_indices])
+                ):
+                    label_indices = batch_indices[i].tolist()
+                    probs = batch_probs[i].tolist()
+                    labels = [inv_labels[idx] for idx in label_indices]
+                    bases = [base_unicode_map.get(lbl, "?") for lbl in labels]
+
+                    if args.show_grid and not args.quiet:
+                        grid = batch_grids[i]
+                        grid_str = "\n".join(
+                            " ".join(f"{int(v):04d}" for v in row.tolist())
+                            for row in grid.tolist()
+                        )
+                        print(f"[GRID] {raster_path.name}\n{grid_str}")
+
+                    if not args.quiet:
+                        top1_label = labels[0]
+                        top1_base = bases[0]
+                        # Derive input label (everything before last underscore) to map its base char (if available)
+                        stem = raster_path.stem
+                        input_label = stem.rsplit("_", 1)[0] if "_" in stem else stem
+                        input_base = base_unicode_map.get(input_label, "?")
+                        # Determine match status emoji:
+                        # ✅ if top1 label matches input_label
+                        # ❗ if input_label appears in remaining top-K
+                        # ❌ otherwise
+                        if input_label == top1_label:
+                            status_emoji = "✅"
+                        elif input_label in labels[1 : args.topk]:
+                            status_emoji = "❗"
+                        else:
+                            status_emoji = "❌"
+                        # Concise log format:
+                        # {input unicode} -> {top match unicode} [top5 unicodes] (filename) {emoji}
+                        top5_bases = ", ".join(bases[: args.topk])
+                        print(
+                            f"{input_base} -> {top1_base} [{top5_bases}] ({raster_path.name}) {status_emoji}",
+                            flush=True,
+                        )
+
+                    json_rows.append(
+                        {
+                            "file": raster_path.name,
+                            "topk": [
+                                {
+                                    "rank": r + 1,
+                                    "label": labels[r],
+                                    "base": bases[r],
+                                    "prob": probs[r],
+                                }
+                                for r in range(len(labels))
+                            ],
+                        }
+                    )
+
             except Exception as e:
                 print(
-                    f"[error] Inference failed for {raster_path.name}: {e}",
+                    f"[error] Batch inference failed: {e}",
                     file=sys.stderr,
                 )
                 continue
-
-            if not args.quiet:
-                top1_label = labels[0]
-                top1_base = bases[0]
-                # Derive input label (everything before last underscore) to map its base char (if available)
-                stem = raster_path.stem
-                input_label = stem.rsplit("_", 1)[0] if "_" in stem else stem
-                input_base = base_unicode_map.get(input_label, "?")
-                # Determine match status emoji:
-                # ✅ if top1 label matches input_label
-                # ❗ if input_label appears in remaining top-K
-                # ❌ otherwise
-                if input_label == top1_label:
-                    status_emoji = "✅"
-                elif input_label in labels[1 : args.topk]:
-                    status_emoji = "❗"
-                else:
-                    status_emoji = "❌"
-                # Concise log format:
-                # {input unicode} -> {top match unicode} [top5 unicodes] (filename) {emoji}
-                top5_bases = ", ".join(bases[: args.topk])
-                print(
-                    f"{input_base} -> {top1_base} [{top5_bases}] ({raster_path.name}) {status_emoji}",
-                    flush=True,
-                )
-
-            json_rows.append(
-                {
-                    "file": raster_path.name,
-                    "topk": [
-                        {
-                            "rank": r + 1,
-                            "label": labels[r],
-                            "base": bases[r],
-                            "prob": probs[r],
-                        }
-                        for r in range(len(labels))
-                    ],
-                }
-            )
 
     if args.output_json:
         write_jsonl(args.output_json, json_rows)
