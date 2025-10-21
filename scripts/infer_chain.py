@@ -50,6 +50,7 @@ import csv
 import json
 import math
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -1127,6 +1128,9 @@ def main(argv: Optional[List[str]] = None) -> None:
         flush=True,
     )
 
+    # Start inference timer (after models loaded and ready)
+    inference_start_time = time.time()
+
     json_rows: List[Dict[str, Any]] = []
 
     if memmap_mode:
@@ -1267,6 +1271,20 @@ def main(argv: Optional[List[str]] = None) -> None:
                     file=sys.stderr,
                 )
                 continue
+
+    # End inference timer
+    inference_end_time = time.time()
+    inference_duration = inference_end_time - inference_start_time
+
+    if not args.quiet:
+        num_glyphs = len(json_rows)
+        avg_time_per_glyph = (
+            (inference_duration / num_glyphs * 1000) if num_glyphs > 0 else 0
+        )
+        print(
+            f"[TIMING] Inference time: {inference_duration:.3f}s for {num_glyphs} glyphs ({avg_time_per_glyph:.2f}ms per glyph)",
+            flush=True,
+        )
 
     if args.output_json:
         write_jsonl(args.output_json, json_rows)
