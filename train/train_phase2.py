@@ -499,6 +499,7 @@ def run_epoch(
     compute_confusion: bool = False,
     num_classes: int = 0,
     track_subset_diacritic: bool = False,
+    loss_cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     model.train(is_train)
     scaler = torch.cuda.amp.GradScaler(
@@ -560,7 +561,7 @@ def run_epoch(
 
             # Add auxiliary sequence loss if available
             if aux_outputs is not None and "sequence_logits" in aux_outputs:
-                sequence_weight = loss_cfg.get("sequence_weight", 0.3)
+                sequence_weight = (loss_cfg or {}).get("sequence_weight", 0.3)
                 aux_loss = loss_fn(aux_outputs["sequence_logits"], labels)
                 loss = loss + sequence_weight * aux_loss
 
@@ -1366,6 +1367,7 @@ def train_phase2(cfg: Phase2Config):
             compute_confusion=True,
             num_classes=num_labels,
             track_subset_diacritic=track_diacritic,
+            loss_cfg=loss_cfg,
         )
 
         # Compute macro F1 variants if confusion matrix available
@@ -1651,6 +1653,7 @@ def train_phase2(cfg: Phase2Config):
         compute_confusion=True,
         num_classes=num_labels,
         track_subset_diacritic=track_diacritic,
+        loss_cfg=loss_cfg,
     )
     macro_f1_test_seen = None
     macro_f1_test_all = None
