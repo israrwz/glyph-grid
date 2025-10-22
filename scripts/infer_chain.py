@@ -1392,6 +1392,10 @@ def main(argv: Optional[List[str]] = None) -> None:
             ctx_grids = None
             ctx_deltas = None
             if args.use_sequence_context and hasattr(phase2, "context_window"):
+                print(
+                    f"[DEBUG] Loading sequence context for glyph_id={gid}, window={args.context_window}",
+                    flush=True,
+                )
                 # Find neighbors
                 window = args.context_window
                 neighbors = []
@@ -1429,14 +1433,39 @@ def main(argv: Optional[List[str]] = None) -> None:
                 if neighbors:
                     ctx_grids = torch.stack(neighbors, dim=0)  # (K, 16, 16)
                     ctx_deltas = torch.tensor(deltas, dtype=torch.long)  # (K,)
+                    print(
+                        f"[DEBUG] Context loaded: {len(neighbors)} neighbors, deltas={deltas}",
+                        flush=True,
+                    )
+                else:
+                    print(f"[DEBUG] No neighbors found for glyph_id={gid}", flush=True)
+            else:
+                if not args.use_sequence_context:
+                    print(
+                        f"[DEBUG] Sequence context disabled (--use-sequence-context not set)",
+                        flush=True,
+                    )
+                elif not hasattr(phase2, "context_window"):
+                    print(
+                        f"[DEBUG] Model does not have context_window attribute (not a sequence model)",
+                        flush=True,
+                    )
 
             with torch.no_grad():
+                print(
+                    f"[DEBUG] Calling predict_glyph_grid with context={'YES' if ctx_grids is not None else 'NO'}",
+                    flush=True,
+                )
                 label_indices, probs = predict_glyph_grid(
                     grid,
                     phase2,
                     topk=args.topk,
                     context_grids=ctx_grids,
                     context_deltas=ctx_deltas,
+                )
+                print(
+                    f"[DEBUG] Prediction: top1_idx={label_indices[0]}, prob={probs[0]:.4f}",
+                    flush=True,
                 )
             labels = [inv_labels[i] for i in label_indices]
             bases = [base_unicode_map.get(lbl, "?") for lbl in labels]
