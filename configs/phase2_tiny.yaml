@@ -1,0 +1,278 @@
+# Phase 2 (Glyph Classification) – Tiny CNN Variant
+# File: phase2_tiny.yaml
+#
+# Purpose:
+#   An ultra-lightweight Phase 2 model for maximum inference speed with acceptable accuracy.
+#   Further reduces capacity from phase2_light.yaml while maintaining reasonable performance.
+#
+# Key Changes vs phase2_light.yaml:
+#   - embedding_dim: 64 -> 48
+#   - cnn stages: [64,128,192] -> [48,96,128]
+#   - blocks_per_stage: [2,2,2] -> [2,2,2] (kept for stability)
+#   - classifier_hidden_dim: 256 -> 128
+#   - dropout: 0.10 -> 0.08 (reduced for smaller model)
+#   - classifier_dropout: 0.25 -> 0.20
+#
+# Parameter Count (Approximate):
+#   Embedding: 1024 * 48 = 49,152
+#   Stem Conv: 48*48*3*3 + BN = ~20,800
+#   Stage0 (2 blocks @48): ~2 * (48*48*3*3*2 + BN) ≈ 83,000
+#   Downsample 48→96: 96*48*3*3 + BN ≈ 41,500
+#   Stage1 (2 blocks @96): ~2 * (96*96*3*3*2 + BN) ≈ 331,000
+#   Downsample 96→128: 128*96*3*3 + BN ≈ 110,800
+#   Stage2 (2 blocks @128): ~2 * (128*128*3*3*2 + BN) ≈ 590,000
+#   Conv trunk total: ≈1,180,000
+#   Classifier Head:
+#       LayerNorm(128): 256
+#       Linear 128→128: 128*128 + 128 = 16,512
+#       Linear 128→1216: 128*1216 + 1216 = 156,864
+#       Head total: ≈173,632
+#   Grand Total ≈ 1,402,784 parameters (≈1.4M)
+#
+# Expected Effects:
+#   - ~50% reduction vs phase2_light (~2.83M params)
+#   - ~80% reduction vs phase2 full (~7.2M params)
+#   - 2-3x faster inference than phase2_light
+#   - Acceptable for scenarios where speed > accuracy (e.g., real-time preview)
+#
+# Recommendations:
+#   - Expect 5-10% accuracy drop vs full model
+#   - Use knowledge distillation from larger model if accuracy critical
+#   - Consider ensemble with phase2_light for best speed/accuracy tradeoff
+#
+# ------------------------------------------------------------------
+# Experiment Meta
+# ------------------------------------------------------------------
+experiment:
+  name: phase2_cnn_tiny_v1
+  notes: >
+    Tiny CNN: embedding_dim=48, stages=[48,96,128], blocks=[2,2,2],
+    classifier_hidden_dim=128. Target ≈1.4M params for fastest inference.
+
+seed: 42
+deterministic: true
+
+# ------------------------------------------------------------------
+# Data Paths
+# ------------------------------------------------------------------
+data:
+  root: data/grids_memmap
+  grids_dir: data/grids_memmap
+  labels_file: data/grids_memmap/label_map.json
+  index_train: data/grids_memmap/splits/phase2_train_ids.txt
+  index_val: data/grids_memmap/splits/phase2_val_ids.txt
+  index_test: data/grids_memmap/splits/phase2_test_ids.txt
+  primitive_centroids: assets/centroids/primitive_centroids.npy
+  memmap_grids_file: data/grids_memmap/grids_uint16.npy
+  memmap_row_ids_file: data/grids_memmap/glyph_row_ids.npy
+  glyph_labels_file: data/grids_memmap/glyph_labels.jsonl
+
+# ------------------------------------------------------------------
+# Input Representation
+# ------------------------------------------------------------------
+input:
+  grid_rows: 16
+  grid_cols: 16
+  primitive_vocab_size: 1024
+  embedding_dim: 48             # Further reduced from 64
+  positional_encoding: sinusoidal_2d
+  combine_mode: add
+  patch_grouping:
+    enabled: true
+    patch_rows: 4
+    patch_cols: 4
+  token_pooling: cls
+  use_cls_token: true
+  normalize_embeddings: false
+
+# ------------------------------------------------------------------
+# Model Definition
+# ------------------------------------------------------------------
+model:
+  architecture: cnn
+  transformer:  # (unused; kept for compatibility)
+    num_layers: 5
+    d_model: 256
+    num_heads: 8
+    mlp_hidden_dim: 512
+    dropout: 0.1
+    attention_dropout: 0.1
+    layer_norm_eps: 1.0e-5
+    pre_norm: true
+  classifier:
+    hidden_dim: 128           # Reduced from 256
+    dropout: 0.12
+    activation: gelu
+  cnn:
+    stages: [48, 96, 128]     # Smaller widths
+    blocks_per_stage: [2, 2, 2]
+    kernel_size: 3
+    stem_kernel_size: 3
+    stem_stride: 1
+    downsample: conv
+    activation: gelu          # Can use 'relu' for extra CPU speed
+    dropout: 0.08             # Reduced for tiny model
+    classifier_hidden_dim: 128
+    classifier_dropout: 0.20
+  init:
+    embedding_from_centroids: false
+    centroid_requires_grad: true
+    cls_init: normal
+    weight_init: xavier_uniform
+
+# ------------------------------------------------------------------
+# Optimization & Training
+# ------------------------------------------------------------------
+optim:
+  name: adamw
+  lr: 0.0008                  # Higher LR for faster convergence with fewer params
+  weight_decay: 8.0e-5        # Slightly reduced weight decay
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  grad_clip_norm: 1.0
+
+scheduler:
+  strategy: cosine
+  warmup_epochs: 4            # Longer warmup for stability
+  min_lr_scale: 0.05
+
+training:
+  unweighted_finetune_after_epoch: 15
+  epochs: 50                  # More epochs to compensate for capacity
+  batch_size: 1024
+  eval_batch_size: 1024
+  num_workers: 2
+  pin_memory: true
+  gradient_accumulation_steps: 1
+  auto_lr_scale: true
+  base_batch_size_for_lr: 256
+  target_effective_batch_size: 4096
+  compile: true
+  log_interval_steps: 25
+  token_id_dropout: 0.02
+  val_interval_epochs: 1
+  save_every_epochs: 1
+  mixed_precision: amp
+  cache_grids: true
+  resume_from:
+
+early_stopping:
+  enabled: true
+  metric: val/accuracy_top1
+  mode: max
+  patience: 8                 # More patience for tiny model
+  min_delta: 0.0005
+
+# ------------------------------------------------------------------
+# Loss Configuration
+# ------------------------------------------------------------------
+loss:
+  primary: cross_entropy
+  label_smoothing: 0.05
+  class_weights: auto_inverse_freq
+  class_weights_alpha: 0.2
+  auxiliary_diacritic:
+    enabled: false
+    weight: 0.1
+    label_source: metadata
+  reduction: mean
+
+# ------------------------------------------------------------------
+# Metrics
+# ------------------------------------------------------------------
+metrics:
+  - accuracy_top1
+  - accuracy_top5
+  - macro_f1
+  - per_class_accuracy
+  - diacritic_subset_accuracy
+  - ligature_subset_accuracy
+
+# ------------------------------------------------------------------
+# Checkpointing
+# ------------------------------------------------------------------
+checkpoint:
+  dir: checkpoints/phase2_tiny
+  monitor: val/accuracy_top1
+  mode: max
+  save_top_k: 3
+  save_last: true
+  filename_pattern: "epoch{epoch:02d}-val{val_accuracy_top1:.4f}-tiny.pt"
+  keep_every_n_epochs: 0
+
+# ------------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------------
+logging:
+  backend: tensorboard
+  tensorboard_dir: logs/phase2_tiny
+  run_name: "${experiment.name}"
+  log_hparams: true
+  wandb:
+    enabled: false
+    project: glyph-grid
+    tags: ["phase2", "cnn", "tiny", "embedding48", "fast-inference"]
+
+# ------------------------------------------------------------------
+# Evaluation / Analysis Hooks
+# ------------------------------------------------------------------
+evaluation:
+  confusion_matrix: true
+  topk: [1, 5]
+  attention_heatmap:
+    enabled: true
+    sample_count: 50
+  export_embeddings:
+    enabled: false
+    layer: penultimate
+    path: artifacts/phase2_tiny_embeddings.npy
+
+# ------------------------------------------------------------------
+# Sanity & Validation
+# ------------------------------------------------------------------
+sanity:
+  expect_grid_shape: [16, 16]
+  primitive_vocab_size: 1024
+  embedding_dim: 48
+  d_model: 256
+  mlp_hidden_dim: 512
+  assert_cls_token: true
+
+# ------------------------------------------------------------------
+# Debug
+# ------------------------------------------------------------------
+debug:
+  fast_dev_run: false
+  limit_train_batches: null
+  limit_val_batches: null
+  overfit_batches: 0
+  deterministic_hash_check: false
+
+# ------------------------------------------------------------------
+# Notes
+# ------------------------------------------------------------------
+# Model Size Comparison:
+#   phase2.yaml:        ~7.2M params (full capacity)
+#   phase2_light.yaml:  ~2.8M params (light variant)
+#   phase2_tiny.yaml:   ~1.4M params (this config)
+#
+# Use Cases:
+#   - Real-time inference on CPU
+#   - Mobile/edge deployment
+#   - Batch inference where throughput > accuracy
+#   - Preview/draft mode in interactive applications
+#
+# Performance Tuning:
+#   - If accuracy drop >10%, consider:
+#     1. Knowledge distillation from phase2.yaml
+#     2. Increase to [48,96,144] stages
+#     3. Add one more block: [2,3,2]
+#   - For even faster inference:
+#     1. Change activation to 'relu'
+#     2. Reduce embedding_dim to 32
+#     3. Remove classifier hidden layer (set to 0)
+#
+# Expected Accuracy:
+#   - Top-1: 85-90% (vs 93-95% for full model)
+#   - Top-5: 95-97% (vs 98-99% for full model)
+#   - Inference: 8-10ms per glyph (vs 17ms for light)
