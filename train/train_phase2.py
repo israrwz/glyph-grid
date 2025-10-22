@@ -111,6 +111,15 @@ try:
 except Exception:
     _PHASE2_CNN_AVAILABLE = False
 
+# Sequence-aware CNN import
+try:
+    from models.phase2_cnn_sequence import build_phase2_sequence_model  # type: ignore
+    from train.dataset_sequence import GlyphGridSequenceDataset, collate_sequence_batch
+
+    _PHASE2_SEQUENCE_AVAILABLE = True
+except Exception:
+    _PHASE2_SEQUENCE_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # Config dataclass
 # ---------------------------------------------------------------------------
@@ -158,6 +167,12 @@ def set_seed(seed: int, deterministic: bool = True):
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
+
+
+def _is_sequence_architecture(cfg: "Phase2Config") -> bool:
+    """Check if config specifies sequence-aware architecture."""
+    arch = cfg.get("model", "architecture")
+    return arch == "cnn_sequence"
 
 
 class GlyphGridDataset(Dataset):
@@ -502,13 +517,48 @@ def run_epoch(
     subset_correct = 0
 
     for batch in loader:
-        grids, labels, glyph_ids, diacritic_flags = batch
+        # Unpack batch - handle both standard and sequence datasets
+        if len(batch) == 4:
+            # Standard dataset: (grids, labels, glyph_ids, diacritic_flags)
+            grids, labels, glyph_ids, diacritic_flags = batch
+            context_grids = None
+            context_deltas = None
+        else:
+            # Sequence dataset: (center_grids, context_grids, context_deltas, labels, glyph_ids, diacritic_flags)
+            grids, context_grids, context_deltas, labels, glyph_ids, diacritic_flags = batch
+            context_grids = context_grids.to(device, non_blocking=True)
+            context_deltas = context_deltas.to(device, non_blocking=True)
+
         grids = grids.to(device, non_blocking=True)  # (B,16,16)
         labels = torch.as_tensor(labels, device=device, dtype=torch.long)
 
         with torch.cuda.amp.autocast(enabled=mixed_precision and device.type == "cuda"):
-            logits = model(grids)  # (B,C)
+            # Forward pass - handle both standard and sequence models
+            if context_grids is not None:
+                # Sequence-aware model
+                output = model(grids, context_grids, context_deltas)
+                if isinstance(output, tuple):
+                    logits, aux_outputs = output
+                else:
+                    logits = output
+                    aux_outputs = None
+            else:
+                # Standard model or sequence model in visual-only mode
+                output = model(grids)
+                if isinstance(output, tuple):
+                    logits, aux_outputs = output
+                else:
+                    logits = output
+                    aux_outputs = None
+
+            # Compute loss
             loss = loss_fn(logits, labels)
+
+            # Add auxiliary sequence loss if available
+            if aux_outputs is not None and "sequence_logits" in aux_outputs:
+                sequence_weight = loss_cfg.get("sequence_weight", 0.3)
+                aux_loss = loss_fn(aux_outputs["sequence_logits"], labels)
+                loss = loss + sequence_weight * aux_loss
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)  # type: ignore
@@ -753,44 +803,98 @@ def train_phase2(cfg: Phase2Config):
         data_cfg.get("memmap_row_ids_file", grids_dir / "glyph_row_ids.npy")
     )
 
-    train_ds = GlyphGridDataset(
-        train_ids,
-        grids_dir,
-        label_map,
-        glyph_to_label,
-        diacritic_flags if track_diacritic else None,
-        cache=False,
-        memmap_grids_file=memmap_grids_file if memmap_grids_file.exists() else None,
-        memmap_row_ids_file=memmap_row_ids_file
-        if memmap_row_ids_file.exists()
-        else None,
-    )
-    val_ds = GlyphGridDataset(
-        val_ids,
-        grids_dir,
-        label_map,
-        glyph_to_label,
-        diacritic_flags if track_diacritic else None,
-        cache=False,
-        memmap_grids_file=memmap_grids_file if memmap_grids_file.exists() else None,
-        memmap_row_ids_file=memmap_row_ids_file
-        if memmap_row_ids_file.exists()
-        else None,
-    )
-    test_ds = GlyphGridDataset(
-        test_ids,
-        grids_dir,
-        label_map,
-        glyph_to_label,
-        diacritic_flags if track_diacritic else None,
-        cache=False,
-        memmap_grids_file=memmap_grids_file if memmap_grids_file.exists() else None,
-        memmap_row_ids_file=memmap_row_ids_file
-        if memmap_row_ids_file.exists()
-        else None,
-    )
+    # Check if we need sequence-aware dataset
+    use_sequence = _is_sequence_architecture(cfg)
+    context_window = 2  # Default
+    if use_sequence:
+        context_window = cfg.get("model", "sequence", "context_window") or 2
+        if not _PHASE2_SEQUENCE_AVAILABLE:
+            raise RuntimeError(
+                "Sequence architecture requires train.dataset_sequence module. "
+                "Ensure GlyphGridSequenceDataset is available."
+            )
+        print(f"[INFO] Using sequence-aware dataset (context_window={context_window})", flush=True)
 
-    # Local collate removed; using top-level collate_grids for multiprocessing safety.
+    if use_sequence:
+        train_ds = GlyphGridSequenceDataset(
+            train_ids,
+            grids_dir,
+            label_map,
+            glyph_to_label,
+            context_window=context_window,
+            diacritic_flags if track_diacritic else None,
+            cache=False,
+            memmap_grids_file=memmap_grids_file if memmap_grids_file.exists() else None,
+            memmap_row_ids_file=memmap_row_ids_file
+            if memmap_row_ids_file.exists()
+            else None,
+        )
+        val_ds = GlyphGridSequenceDataset(
+            val_ids,
+            grids_dir,
+            label_map,
+            glyph_to_label,
+            context_window=context_window,
+            diacritic_flags if track_diacritic else None,
+            cache=False,
+            memmap_grids_file=memmap_grids_file if memmap_grids_file.exists() else None,
+            memmap_row_ids_file=memmap_row_ids_file
+            if memmap_row_ids_file.exists()
+            else None,
+        )
+        test_ds = GlyphGridSequenceDataset(
+            test_ids,
+            grids_dir,
+            label_map,
+            glyph_to_label,
+            context_window=context_window,
+            diacritic_flags if track_diacritic else None,
+            cache=False,
+            memmap_grids_file=memmap_grids_file if memmap_grids_file.exists() else None,
+            memmap_row_ids_file=memmap_row_ids_file
+            if memmap_row_ids_file.exists()
+            else None,
+        )
+    else:
+        train_ds = GlyphGridDataset(
+            train_ids,
+            grids_dir,
+            label_map,
+            glyph_to_label,
+            diacritic_flags if track_diacritic else None,
+            cache=False,
+            memmap_grids_file=memmap_grids_file if memmap_grids_file.exists() else None,
+            memmap_row_ids_file=memmap_row_ids_file
+            if memmap_row_ids_file.exists()
+            else None,
+        )
+        val_ds = GlyphGridDataset(
+            val_ids,
+            grids_dir,
+            label_map,
+            glyph_to_label,
+            diacritic_flags if track_diacritic else None,
+            cache=False,
+            memmap_grids_file=memmap_grids_file if memmap_grids_file.exists() else None,
+            memmap_row_ids_file=memmap_row_ids_file
+            if memmap_row_ids_file.exists()
+            else None,
+        )
+        test_ds = GlyphGridDataset(
+            test_ids,
+            grids_dir,
+            label_map,
+            glyph_to_label,
+            diacritic_flags if track_diacritic else None,
+            cache=False,
+            memmap_grids_file=memmap_grids_file if memmap_grids_file.exists() else None,
+            memmap_row_ids_file=memmap_row_ids_file
+            if memmap_row_ids_file.exists()
+            else None,
+        )
+
+    # Choose collate function based on dataset type
+    collate_fn = collate_sequence_batch if use_sequence else collate_grids
 
     train_loader = DataLoader(
         train_ds,
@@ -799,7 +903,7 @@ def train_phase2(cfg: Phase2Config):
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
-        collate_fn=collate_grids,
+        collate_fn=collate_fn,
     )
     val_loader = DataLoader(
         val_ds,
@@ -808,7 +912,7 @@ def train_phase2(cfg: Phase2Config):
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
-        collate_fn=collate_grids,
+        collate_fn=collate_fn,
     )
     test_loader = DataLoader(
         test_ds,
@@ -817,7 +921,7 @@ def train_phase2(cfg: Phase2Config):
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
-        collate_fn=collate_grids,
+        collate_fn=collate_fn,
     )
 
     # Model
@@ -831,7 +935,15 @@ def train_phase2(cfg: Phase2Config):
     # Model (branch on architecture)
     # ------------------------------------------------------------------
     architecture = (cfg.get("model", "architecture") or "transformer").lower()
-    if architecture == "cnn":
+    if architecture == "cnn_sequence":
+        if not _PHASE2_SEQUENCE_AVAILABLE:
+            raise RuntimeError(
+                "CNN sequence architecture selected but models.phase2_cnn_sequence unavailable."
+            )
+        model = build_phase2_sequence_model(
+            cfg.raw, num_labels=len(label_map), primitive_centroids=centroids_array
+        )
+    elif architecture == "cnn":
         if not _PHASE2_CNN_AVAILABLE:
             raise RuntimeError(
                 "Requested model.architecture=cnn but phase2_cnn module not available."
@@ -1109,7 +1221,12 @@ def train_phase2(cfg: Phase2Config):
             with torch.cuda.amp.autocast(
                 enabled=mixed_precision and device.type == "cuda"
             ):
-                logits = model(grids)
+                # Handle sequence model outputs
+                output = model(grids)
+                if isinstance(output, tuple):
+                    logits, _ = output
+                else:
+                    logits = output
                 loss = loss_fn(logits, labels) / gradient_accum
             if mixed_precision and scaler.is_enabled():
                 scaler.scale(loss).backward()
