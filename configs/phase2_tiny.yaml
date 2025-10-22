@@ -138,7 +138,7 @@ scheduler:
 
 training:
   unweighted_finetune_after_epoch: 15
-  epochs: 80 # More epochs to compensate for capacity
+  epochs: 120 # More epochs to compensate for capacity
   batch_size: 1024
   eval_batch_size: 1024
   num_workers: 2
