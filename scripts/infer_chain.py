@@ -90,6 +90,7 @@ if str(repo_root) not in sys.path:
 from models.phase1_cnn import build_phase1_model
 from models.phase2_cnn import build_phase2_cnn_model
 from models.phase2_transformer import build_phase2_model
+from models.phase2_cnn_sequence import build_phase2_sequence_model
 
 # ---------------------------------------------------------------------------
 # Device
@@ -499,9 +500,13 @@ def predict_glyph_grid(
     grid: torch.Tensor,
     phase2_model: nn.Module,
     topk: int = 5,
+    context_grids: Optional[torch.Tensor] = None,
+    context_deltas: Optional[torch.Tensor] = None,
 ) -> Tuple[List[int], List[float]]:
     """
     grid: (16,16) int64 primitive IDs
+    context_grids: Optional (K, 16, 16) for sequence-aware models
+    context_deltas: Optional (K,) relative glyph_id deltas
     Returns:
       topk_indices, topk_probs
     """
@@ -510,7 +515,21 @@ def predict_glyph_grid(
     input_tensor = grid.unsqueeze(0).to(torch.long).to(DEVICE)  # (1,16,16)
 
     with torch.no_grad():
-        logits = phase2_model(input_tensor)
+        # Check if model supports sequence context
+        if context_grids is not None and context_deltas is not None:
+            ctx_tensor = (
+                context_grids.unsqueeze(0).to(torch.long).to(DEVICE)
+            )  # (1,K,16,16)
+            delta_tensor = (
+                context_deltas.unsqueeze(0).to(torch.long).to(DEVICE)
+            )  # (1,K)
+            logits, _ = phase2_model(input_tensor, ctx_tensor, delta_tensor)
+        else:
+            # Visual-only mode (works for both regular and sequence models)
+            output = phase2_model(input_tensor)
+            # Handle both tuple and tensor returns
+            logits = output[0] if isinstance(output, tuple) else output
+
         probs = torch.softmax(logits, dim=1)
         values, indices = torch.topk(probs, k=topk, dim=1)
 
@@ -521,11 +540,15 @@ def predict_glyph_grid_batch(
     grids: torch.Tensor,
     phase2_model: nn.Module,
     topk: int = 5,
+    context_grids: Optional[torch.Tensor] = None,
+    context_deltas: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Batched version of predict_glyph_grid.
 
     grids: (B, 16, 16) int64 primitive IDs
+    context_grids: Optional (B, K, 16, 16) for sequence-aware models
+    context_deltas: Optional (B, K) relative glyph_id deltas
     Returns:
       topk_indices: (B, topk) int
       topk_probs: (B, topk) float
@@ -536,7 +559,16 @@ def predict_glyph_grid_batch(
     input_tensor = grids.to(torch.long).to(DEVICE)  # (B, 16, 16)
 
     with torch.no_grad():
-        logits = phase2_model(input_tensor)
+        # Check if model supports sequence context
+        if context_grids is not None and context_deltas is not None:
+            ctx_tensor = context_grids.to(torch.long).to(DEVICE)  # (B,K,16,16)
+            delta_tensor = context_deltas.to(torch.long).to(DEVICE)  # (B,K)
+            logits, _ = phase2_model(input_tensor, ctx_tensor, delta_tensor)
+        else:
+            # Visual-only mode
+            output = phase2_model(input_tensor)
+            logits = output[0] if isinstance(output, tuple) else output
+
         probs = torch.softmax(logits, dim=1)
         values, indices = torch.topk(probs, k=topk, dim=1)
 
@@ -851,6 +883,17 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=Path,
         default=Path("cache/openvino"),
         help="Directory for OpenVINO model cache (default: cache/openvino).",
+    )
+    ap.add_argument(
+        "--use-sequence-context",
+        action="store_true",
+        help="Enable sequence context for sequence-aware models (loads neighbor glyphs).",
+    )
+    ap.add_argument(
+        "--context-window",
+        type=int,
+        default=2,
+        help="Context window size for sequence-aware models (default: 2, meaning 2 before + 2 after).",
     )
     return ap.parse_args(argv)
 
@@ -1341,8 +1384,56 @@ def main(argv: Optional[List[str]] = None) -> None:
             gid = int(memmap_row_ids[pos])
             raw_grid = memmap_grids[pos]  # numpy (16,16)
             grid = torch.from_numpy(raw_grid.astype("int64"))
+            # Load context for sequence-aware models
+            ctx_grids = None
+            ctx_deltas = None
+            if args.use_sequence_context and hasattr(phase2, "context_window"):
+                # Find neighbors
+                window = args.context_window
+                neighbors = []
+                deltas = []
+                for offset in range(-window, 0):
+                    neighbor_gid = gid + offset
+                    neighbor_pos = None
+                    for p, rid in enumerate(memmap_row_ids):
+                        if rid == neighbor_gid:
+                            neighbor_pos = p
+                            break
+                    if neighbor_pos is not None:
+                        neighbors.append(
+                            torch.from_numpy(memmap_grids[neighbor_pos].astype("int64"))
+                        )
+                        deltas.append(offset)
+                    else:
+                        neighbors.append(torch.zeros((16, 16), dtype=torch.int64))
+                        deltas.append(offset)
+                for offset in range(1, window + 1):
+                    neighbor_gid = gid + offset
+                    neighbor_pos = None
+                    for p, rid in enumerate(memmap_row_ids):
+                        if rid == neighbor_gid:
+                            neighbor_pos = p
+                            break
+                    if neighbor_pos is not None:
+                        neighbors.append(
+                            torch.from_numpy(memmap_grids[neighbor_pos].astype("int64"))
+                        )
+                        deltas.append(offset)
+                    else:
+                        neighbors.append(torch.zeros((16, 16), dtype=torch.int64))
+                        deltas.append(offset)
+                if neighbors:
+                    ctx_grids = torch.stack(neighbors, dim=0)  # (K, 16, 16)
+                    ctx_deltas = torch.tensor(deltas, dtype=torch.long)  # (K,)
+
             with torch.no_grad():
-                label_indices, probs = predict_glyph_grid(grid, phase2, topk=args.topk)
+                label_indices, probs = predict_glyph_grid(
+                    grid,
+                    phase2,
+                    topk=args.topk,
+                    context_grids=ctx_grids,
+                    context_deltas=ctx_deltas,
+                )
             labels = [inv_labels[i] for i in label_indices]
             bases = [base_unicode_map.get(lbl, "?") for lbl in labels]
             top1_label = labels[0]
