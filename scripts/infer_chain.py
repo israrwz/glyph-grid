@@ -1392,10 +1392,6 @@ def main(argv: Optional[List[str]] = None) -> None:
             ctx_grids = None
             ctx_deltas = None
             if args.use_sequence_context and hasattr(phase2, "context_window"):
-                print(
-                    f"[DEBUG] Loading sequence context for glyph_id={gid}, window={args.context_window}",
-                    flush=True,
-                )
                 # Find neighbors
                 window = args.context_window
                 neighbors = []
@@ -1433,39 +1429,14 @@ def main(argv: Optional[List[str]] = None) -> None:
                 if neighbors:
                     ctx_grids = torch.stack(neighbors, dim=0)  # (K, 16, 16)
                     ctx_deltas = torch.tensor(deltas, dtype=torch.long)  # (K,)
-                    print(
-                        f"[DEBUG] Context loaded: {len(neighbors)} neighbors, deltas={deltas}",
-                        flush=True,
-                    )
-                else:
-                    print(f"[DEBUG] No neighbors found for glyph_id={gid}", flush=True)
-            else:
-                if not args.use_sequence_context:
-                    print(
-                        f"[DEBUG] Sequence context disabled (--use-sequence-context not set)",
-                        flush=True,
-                    )
-                elif not hasattr(phase2, "context_window"):
-                    print(
-                        f"[DEBUG] Model does not have context_window attribute (not a sequence model)",
-                        flush=True,
-                    )
 
             with torch.no_grad():
-                print(
-                    f"[DEBUG] Calling predict_glyph_grid with context={'YES' if ctx_grids is not None else 'NO'}",
-                    flush=True,
-                )
                 label_indices, probs = predict_glyph_grid(
                     grid,
                     phase2,
                     topk=args.topk,
                     context_grids=ctx_grids,
                     context_deltas=ctx_deltas,
-                )
-                print(
-                    f"[DEBUG] Prediction: top1_idx={label_indices[0]}, prob={probs[0]:.4f}",
-                    flush=True,
                 )
             labels = [inv_labels[i] for i in label_indices]
             bases = [base_unicode_map.get(lbl, "?") for lbl in labels]
@@ -1505,17 +1476,105 @@ def main(argv: Optional[List[str]] = None) -> None:
         batch_size = args.batch_size
         num_rasters = len(rasters)
 
+        # Build glyph_id -> raster_path mapping for sequence context
+        glyph_id_to_raster: Dict[int, Path] = {}
+        if args.use_sequence_context and hasattr(phase2, "context_window"):
+            for raster_path in rasters:
+                stem = raster_path.stem
+                # Extract glyph_id from filename (e.g., "78_latin_566636.png" -> 566636)
+                parts = stem.rsplit("_", 1)
+                if len(parts) == 2 and parts[1].isdigit():
+                    gid = int(parts[1])
+                    glyph_id_to_raster[gid] = raster_path
+            if glyph_id_to_raster:
+                print(
+                    f"[INFO] Sequence context enabled for raster mode: {len(glyph_id_to_raster)} rasters indexed",
+                    flush=True,
+                )
+
         for batch_start in range(0, num_rasters, batch_size):
             batch_end = min(batch_start + batch_size, num_rasters)
             batch_rasters = rasters[batch_start:batch_end]
 
-            # Phase 1: Convert rasters to grids
+            # Phase 1: Convert rasters to grids (and context if sequence mode)
             batch_grids = []
+            batch_context_grids = []
+            batch_context_deltas = []
             valid_indices = []
+
             for i, raster_path in enumerate(batch_rasters):
                 try:
                     grid = raster_to_primitive_grid(raster_path, phase1)
                     batch_grids.append(grid)
+
+                    # Load context for sequence-aware models
+                    ctx_grids = None
+                    ctx_deltas = None
+                    if (
+                        args.use_sequence_context
+                        and hasattr(phase2, "context_window")
+                        and glyph_id_to_raster
+                    ):
+                        # Extract glyph_id from filename
+                        stem = raster_path.stem
+                        parts = stem.rsplit("_", 1)
+                        if len(parts) == 2 and parts[1].isdigit():
+                            gid = int(parts[1])
+                            window = args.context_window
+                            neighbors = []
+                            deltas = []
+
+                            # Load neighbors before and after
+                            for offset in range(-window, 0):
+                                neighbor_gid = gid + offset
+                                neighbor_path = glyph_id_to_raster.get(neighbor_gid)
+                                if neighbor_path:
+                                    try:
+                                        neighbor_grid = raster_to_primitive_grid(
+                                            neighbor_path, phase1
+                                        )
+                                        neighbors.append(neighbor_grid)
+                                        deltas.append(offset)
+                                    except Exception:
+                                        neighbors.append(
+                                            torch.zeros((16, 16), dtype=torch.int64)
+                                        )
+                                        deltas.append(offset)
+                                else:
+                                    neighbors.append(
+                                        torch.zeros((16, 16), dtype=torch.int64)
+                                    )
+                                    deltas.append(offset)
+
+                            for offset in range(1, window + 1):
+                                neighbor_gid = gid + offset
+                                neighbor_path = glyph_id_to_raster.get(neighbor_gid)
+                                if neighbor_path:
+                                    try:
+                                        neighbor_grid = raster_to_primitive_grid(
+                                            neighbor_path, phase1
+                                        )
+                                        neighbors.append(neighbor_grid)
+                                        deltas.append(offset)
+                                    except Exception:
+                                        neighbors.append(
+                                            torch.zeros((16, 16), dtype=torch.int64)
+                                        )
+                                        deltas.append(offset)
+                                else:
+                                    neighbors.append(
+                                        torch.zeros((16, 16), dtype=torch.int64)
+                                    )
+                                    deltas.append(offset)
+
+                            if neighbors:
+                                ctx_grids = torch.stack(neighbors, dim=0)  # (K, 16, 16)
+                                ctx_deltas = torch.tensor(
+                                    deltas, dtype=torch.long
+                                )  # (K,)
+
+                    batch_context_grids.append(ctx_grids)
+                    batch_context_deltas.append(ctx_deltas)
                     valid_indices.append(i)
                 except Exception as e:
                     print(
@@ -1531,14 +1590,47 @@ def main(argv: Optional[List[str]] = None) -> None:
             try:
                 grids_tensor = torch.stack(batch_grids)  # (B, 16, 16)
 
+                # Prepare context tensors if any have context
+                has_context = any(ctx is not None for ctx in batch_context_grids)
+                context_grids_tensor = None
+                context_deltas_tensor = None
+
+                if has_context and args.use_sequence_context:
+                    # Stack context (use zeros for items without context)
+                    K = (
+                        batch_context_grids[0].shape[0]
+                        if batch_context_grids[0] is not None
+                        else args.context_window * 2
+                    )
+                    stacked_ctx = []
+                    stacked_deltas = []
+                    for ctx, deltas in zip(batch_context_grids, batch_context_deltas):
+                        if ctx is not None:
+                            stacked_ctx.append(ctx)
+                            stacked_deltas.append(deltas)
+                        else:
+                            stacked_ctx.append(
+                                torch.zeros((K, 16, 16), dtype=torch.int64)
+                            )
+                            stacked_deltas.append(torch.zeros(K, dtype=torch.long))
+                    context_grids_tensor = torch.stack(
+                        stacked_ctx, dim=0
+                    )  # (B, K, 16, 16)
+                    context_deltas_tensor = torch.stack(stacked_deltas, dim=0)  # (B, K)
+
                 # Use OpenVINO or PyTorch
                 if args.use_openvino and openvino_engine:
+                    # OpenVINO doesn't support sequence context yet
                     batch_indices, batch_probs = openvino_engine.predict_batch(
                         grids_tensor, topk=args.topk
                     )
                 else:
                     batch_indices, batch_probs = predict_glyph_grid_batch(
-                        grids_tensor, phase2, topk=args.topk
+                        grids_tensor,
+                        phase2,
+                        topk=args.topk,
+                        context_grids=context_grids_tensor,
+                        context_deltas=context_deltas_tensor,
                     )
 
                 # Process results
