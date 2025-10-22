@@ -1,0 +1,293 @@
+# Phase 2 (Glyph Classification) – Tiny CNN with Sequence Context
+# File: phase2_tiny_seq.yaml
+#
+# Purpose:
+#   Sequence-aware tiny model that leverages glyph order to disambiguate visually
+#   similar glyphs (e.g., Arabic digit 1 vs Aleph, English O vs Arabic heh).
+#   Uses neighbor context from font's glyph order (based on glyph_id sequence).
+#
+# Key Features:
+#   - Base: Tiny CNN (embedding_dim=48, stages=[48,96,128])
+#   - Context window: 2 neighbors before + 2 after = 4 total
+#   - Dual-stream: Visual (center glyph) + Sequence (neighbor context)
+#   - Multi-objective loss: Visual + Sequence consistency
+#   - Graceful fallback: Visual-only when context unavailable
+#
+# Architecture Changes vs phase2_tiny.yaml:
+#   - Added lightweight context encoder for neighbors
+#   - Added LSTM/Attention sequence processor
+#   - Fusion layer combines visual + sequence features
+#   - Auxiliary sequence classifier for multi-task learning
+#
+# Parameter Count (Approximate):
+#   Base CNN (visual): ~1.4M (same as tiny)
+#   Context encoder: ~50K (lightweight CNN per neighbor)
+#   Sequence processor: ~130K (2-layer LSTM)
+#   Fusion layer: ~20K
+#   Aux classifier: ~30K
+#   Grand Total: ≈1.63M parameters
+#
+# Expected Performance:
+#   - Improves accuracy on ambiguous glyphs by 5-15%
+#   - Minimal overhead: ~10% slower than tiny (still 2x faster than light)
+#   - Best for fonts with sequential glyph order (most TrueType/OpenType fonts)
+#   - Falls back gracefully for out-of-order glyphs
+#
+# ------------------------------------------------------------------
+# Experiment Meta
+# ------------------------------------------------------------------
+experiment:
+  name: phase2_cnn_tiny_seq_v1
+  notes: >
+    Sequence-aware tiny CNN: embedding_dim=48, stages=[48,96,128],
+    context_window=2 (4 neighbors total), sequence_hidden=64,
+    multi-task loss (visual + sequence). Target ≈1.63M params.
+
+seed: 42
+deterministic: true
+
+# ------------------------------------------------------------------
+# Data Paths
+# ------------------------------------------------------------------
+data:
+  root: data/grids_memmap
+  grids_dir: data/grids_memmap
+  labels_file: data/grids_memmap/label_map.json
+  index_train: data/grids_memmap/splits/phase2_train_ids.txt
+  index_val: data/grids_memmap/splits/phase2_val_ids.txt
+  index_test: data/grids_memmap/splits/phase2_test_ids.txt
+  primitive_centroids: assets/centroids/primitive_centroids.npy
+  memmap_grids_file: data/grids_memmap/grids_uint16.npy
+  memmap_row_ids_file: data/grids_memmap/glyph_row_ids.npy
+  glyph_labels_file: data/grids_memmap/glyph_labels.jsonl
+
+# ------------------------------------------------------------------
+# Input Representation
+# ------------------------------------------------------------------
+input:
+  grid_rows: 16
+  grid_cols: 16
+  primitive_vocab_size: 1024
+  embedding_dim: 48 # Further reduced from 64
+  positional_encoding: sinusoidal_2d
+  combine_mode: add
+  patch_grouping:
+    enabled: true
+    patch_rows: 4
+    patch_cols: 4
+  token_pooling: cls
+  use_cls_token: true
+  normalize_embeddings: false
+
+# ------------------------------------------------------------------
+# Model Definition
+# ------------------------------------------------------------------
+model:
+  architecture: cnn_sequence
+  transformer: # (unused; kept for compatibility)
+    num_layers: 5
+    d_model: 256
+    num_heads: 8
+    mlp_hidden_dim: 512
+    dropout: 0.1
+    attention_dropout: 0.1
+    layer_norm_eps: 1.0e-5
+    pre_norm: true
+  classifier:
+    hidden_dim: 128 # Reduced from 256
+    dropout: 0.12
+    activation: gelu
+  cnn:
+    stages: [48, 96, 128] # Smaller widths
+    blocks_per_stage: [2, 2, 2]
+    kernel_size: 3
+    stem_kernel_size: 3
+    stem_stride: 1
+    downsample: conv
+    activation: gelu # Can use 'relu' for extra CPU speed
+    dropout: 0.08 # Reduced for tiny model
+    classifier_hidden_dim: 128
+    classifier_dropout: 0.20
+  sequence:
+    context_window: 2 # 2 before + 2 after = 4 neighbors total
+    hidden_dim: 64 # Sequence stream hidden dimension
+    processor: lstm # {lstm, attention}
+    num_layers: 2
+    dropout: 0.1
+    fusion_mode: concat # {concat, gated, weighted_sum}
+    max_delta: 10 # Max glyph_id delta to encode (±10)
+  init:
+    embedding_from_centroids: false
+    centroid_requires_grad: true
+    cls_init: normal
+    weight_init: xavier_uniform
+
+# ------------------------------------------------------------------
+# Optimization & Training
+# ------------------------------------------------------------------
+optim:
+  name: adamw
+  lr: 0.0008 # Higher LR for faster convergence with fewer params
+  weight_decay: 8.0e-5 # Slightly reduced weight decay
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  grad_clip_norm: 1.0
+
+scheduler:
+  strategy: cosine
+  warmup_epochs: 4 # Longer warmup for stability
+  min_lr_scale: 0.05
+
+training:
+  unweighted_finetune_after_epoch: 15
+  epochs: 120 # More epochs to compensate for capacity
+  batch_size: 1024
+  eval_batch_size: 1024
+  num_workers: 2
+  pin_memory: true
+  gradient_accumulation_steps: 1
+  auto_lr_scale: true
+  base_batch_size_for_lr: 256
+  target_effective_batch_size: 4096
+  compile: true
+  log_interval_steps: 25
+  token_id_dropout: 0.02
+  val_interval_epochs: 1
+  save_every_epochs: 1
+  mixed_precision: amp
+  cache_grids: true
+  resume_from:
+
+early_stopping:
+  enabled: true
+  metric: val/accuracy_top1
+  mode: max
+  patience: 8 # More patience for tiny model
+  min_delta: 0.0005
+
+# ------------------------------------------------------------------
+# Loss Configuration
+# ------------------------------------------------------------------
+loss:
+  primary: cross_entropy
+  label_smoothing: 0.05
+  class_weights: auto_inverse_freq
+  class_weights_alpha: 0.2
+  # Sequence-aware loss components
+  visual_weight: 1.0 # Primary: visual classification
+  sequence_weight: 0.3 # Auxiliary: sequence consistency
+  sequence_weight_schedule: fixed # {fixed, linear, cosine}
+  auxiliary_diacritic:
+    enabled: false
+    weight: 0.1
+    label_source: metadata
+  reduction: mean
+
+# ------------------------------------------------------------------
+# Metrics
+# ------------------------------------------------------------------
+metrics:
+  - accuracy_top1
+  - accuracy_top5
+  - macro_f1
+  - per_class_accuracy
+  - diacritic_subset_accuracy
+  - ligature_subset_accuracy
+
+# ------------------------------------------------------------------
+# Checkpointing
+# ------------------------------------------------------------------
+checkpoint:
+  dir: checkpoints/phase2_tiny_seq
+  monitor: val/accuracy_top1
+  mode: max
+  save_top_k: 3
+  save_last: true
+  filename_pattern: "epoch{epoch:02d}-val{val_accuracy_top1:.4f}-tiny-seq.pt"
+  keep_every_n_epochs: 0
+
+# ------------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------------
+logging:
+  backend: tensorboard
+  tensorboard_dir: logs/phase2_tiny_seq
+  run_name: "${experiment.name}"
+  log_hparams: true
+  wandb:
+    enabled: false
+    project: glyph-grid
+    tags: ["phase2", "cnn", "tiny", "sequence", "context-aware", "embedding48"]
+
+# ------------------------------------------------------------------
+# Evaluation / Analysis Hooks
+# ------------------------------------------------------------------
+evaluation:
+  confusion_matrix: true
+  topk: [1, 5]
+  attention_heatmap:
+    enabled: true
+    sample_count: 50
+  export_embeddings:
+    enabled: false
+    layer: penultimate
+    path: artifacts/phase2_tiny_seq_embeddings.npy
+
+# ------------------------------------------------------------------
+# Sanity & Validation
+# ------------------------------------------------------------------
+sanity:
+  expect_grid_shape: [16, 16]
+  primitive_vocab_size: 1024
+  embedding_dim: 48
+  d_model: 256
+  mlp_hidden_dim: 512
+  assert_cls_token: true
+
+# ------------------------------------------------------------------
+# Debug
+# ------------------------------------------------------------------
+debug:
+  fast_dev_run: false
+  limit_train_batches: null
+  limit_val_batches: null
+  overfit_batches: 0
+  deterministic_hash_check: false
+# ------------------------------------------------------------------
+# Notes
+# ------------------------------------------------------------------
+# Model Size Comparison:
+#   phase2.yaml:         ~7.2M params (full capacity)
+#   phase2_light.yaml:   ~2.8M params (light variant)
+#   phase2_tiny.yaml:    ~1.4M params (visual only)
+#   phase2_tiny_seq.yaml: ~1.63M params (this config - visual + sequence)
+#
+# Use Cases:
+#   - Fonts with ambiguous glyphs (Arabic, multilingual)
+#   - Sequential glyph extraction from fonts
+#   - Scenarios where local context is available
+#   - Real-time inference with context (still 2x faster than light)
+#
+# Sequence Context Benefits:
+#   - Disambiguates: Arabic digit 1 (۱) vs Aleph (ا)
+#   - Disambiguates: English O vs Arabic small heh (ه) vs Arabic digit 0 (۰)
+#   - Disambiguates: Period (.) vs other punctuation
+#   - Uses font's natural glyph order (glyph_id sequence)
+#   - Only activates when neighbors available (graceful fallback)
+#
+# Performance Tuning:
+#   - Adjust context_window (1-4) for speed/accuracy tradeoff
+#   - Change sequence.processor to 'attention' for longer context
+#   - Adjust sequence_weight (0.1-0.5) if over/under-relying on context
+#   - Use fusion_mode='gated' for learnable visual/sequence weighting
+#
+# Expected Accuracy:
+#   - Top-1: 87-92% (vs 85-90% for tiny visual-only)
+#   - Top-5: 96-98% (vs 95-97% for tiny visual-only)
+#   - Ambiguous glyphs: +10-20% improvement
+#   - Inference: 9-11ms per glyph (vs 8-10ms for tiny)
+#
+# Limitations:
+#   - Requires sequential context (glyph_id neighbors)
+#   - Less effective for fonts with random glyph order
+#   - Falls back to visual-only at font boundaries
