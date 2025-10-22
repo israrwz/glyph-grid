@@ -525,7 +525,9 @@ def run_epoch(
             context_deltas = None
         else:
             # Sequence dataset: (center_grids, context_grids, context_deltas, labels, glyph_ids, diacritic_flags)
-            grids, context_grids, context_deltas, labels, glyph_ids, diacritic_flags = batch
+            grids, context_grids, context_deltas, labels, glyph_ids, diacritic_flags = (
+                batch
+            )
             context_grids = context_grids.to(device, non_blocking=True)
             context_deltas = context_deltas.to(device, non_blocking=True)
 
@@ -813,7 +815,10 @@ def train_phase2(cfg: Phase2Config):
                 "Sequence architecture requires train.dataset_sequence module. "
                 "Ensure GlyphGridSequenceDataset is available."
             )
-        print(f"[INFO] Using sequence-aware dataset (context_window={context_window})", flush=True)
+        print(
+            f"[INFO] Using sequence-aware dataset (context_window={context_window})",
+            flush=True,
+        )
 
     if use_sequence:
         train_ds = GlyphGridSequenceDataset(
@@ -822,7 +827,7 @@ def train_phase2(cfg: Phase2Config):
             label_map,
             glyph_to_label,
             context_window=context_window,
-            diacritic_flags if track_diacritic else None,
+            diacritic_flags=diacritic_flags if track_diacritic else None,
             cache=False,
             memmap_grids_file=memmap_grids_file if memmap_grids_file.exists() else None,
             memmap_row_ids_file=memmap_row_ids_file
@@ -835,7 +840,7 @@ def train_phase2(cfg: Phase2Config):
             label_map,
             glyph_to_label,
             context_window=context_window,
-            diacritic_flags if track_diacritic else None,
+            diacritic_flags=diacritic_flags if track_diacritic else None,
             cache=False,
             memmap_grids_file=memmap_grids_file if memmap_grids_file.exists() else None,
             memmap_row_ids_file=memmap_row_ids_file
@@ -848,7 +853,7 @@ def train_phase2(cfg: Phase2Config):
             label_map,
             glyph_to_label,
             context_window=context_window,
-            diacritic_flags if track_diacritic else None,
+            diacritic_flags=diacritic_flags if track_diacritic else None,
             cache=False,
             memmap_grids_file=memmap_grids_file if memmap_grids_file.exists() else None,
             memmap_row_ids_file=memmap_row_ids_file
