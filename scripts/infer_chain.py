@@ -214,6 +214,10 @@ def build_phase2_from_yaml(yaml_cfg: Dict[str, Any], num_labels: int) -> nn.Modu
         return build_phase2_cnn_model(
             yaml_cfg, num_labels=num_labels, primitive_centroids=None
         )
+    elif arch == "cnn_sequence":
+        return build_phase2_sequence_model(
+            yaml_cfg, num_labels=num_labels, primitive_centroids=None
+        )
     return build_phase2_model(yaml_cfg, num_labels=num_labels, primitive_centroids=None)
 
 
