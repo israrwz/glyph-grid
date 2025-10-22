@@ -774,12 +774,7 @@ def train_phase2(cfg: Phase2Config):
     pin_memory = bool(training_cfg.get("pin_memory", True))
     # GPU-ready additions:
     # cache_grids: load all grids into RAM (helps when dataset fits memory; speeds IO-bound CPU/GPU training)
-    # persistent_workers: keep DataLoader workers alive between epochs (efficient for many epochs)
     cache_grids = bool(training_cfg.get("cache_grids", torch.cuda.is_available()))
-    persistent_workers = (
-        bool(training_cfg.get("persistent_workers", torch.cuda.is_available()))
-        and num_workers > 0
-    )
     # Auto LR scaling: scale learning rate relative to a base batch size if enabled
     optim_cfg = cfg.get("optim", default={}) or {}
     if training_cfg.get("auto_lr_scale", True) and "lr" in optim_cfg:
@@ -821,6 +816,14 @@ def train_phase2(cfg: Phase2Config):
             f"[INFO] Using sequence-aware dataset (context_window={context_window})",
             flush=True,
         )
+
+    # Set persistent_workers after we know if using sequence dataset
+    # Disable for sequence datasets to avoid memmap deadlock issues
+    use_persistent = training_cfg.get("persistent_workers")
+    if use_persistent is None:
+        # Auto-detect: disable for sequence datasets with memmap
+        use_persistent = torch.cuda.is_available() and not use_sequence
+    persistent_workers = bool(use_persistent) and num_workers > 0
 
     if use_sequence:
         train_ds = GlyphGridSequenceDataset(
