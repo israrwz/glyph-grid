@@ -171,8 +171,9 @@ def set_seed(seed: int, deterministic: bool = True):
 
 def _is_sequence_architecture(cfg: "Phase2Config") -> bool:
     """Check if config specifies sequence-aware architecture."""
-    model_cfg = cfg.get("model", {})
-    arch = model_cfg.get("architecture", "transformer")
+    arch = cfg.get("model", "architecture")
+    if arch is None:
+        arch = "transformer"
     return arch == "cnn_sequence"
 
 
