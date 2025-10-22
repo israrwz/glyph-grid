@@ -74,7 +74,7 @@ input:
   grid_rows: 16
   grid_cols: 16
   primitive_vocab_size: 1024
-  embedding_dim: 48             # Further reduced from 64
+  embedding_dim: 48 # Further reduced from 64
   positional_encoding: sinusoidal_2d
   combine_mode: add
   patch_grouping:
@@ -90,7 +90,7 @@ input:
 # ------------------------------------------------------------------
 model:
   architecture: cnn
-  transformer:  # (unused; kept for compatibility)
+  transformer: # (unused; kept for compatibility)
     num_layers: 5
     d_model: 256
     num_heads: 8
@@ -100,18 +100,18 @@ model:
     layer_norm_eps: 1.0e-5
     pre_norm: true
   classifier:
-    hidden_dim: 128           # Reduced from 256
+    hidden_dim: 128 # Reduced from 256
     dropout: 0.12
     activation: gelu
   cnn:
-    stages: [48, 96, 128]     # Smaller widths
+    stages: [48, 96, 128] # Smaller widths
     blocks_per_stage: [2, 2, 2]
     kernel_size: 3
     stem_kernel_size: 3
     stem_stride: 1
     downsample: conv
-    activation: gelu          # Can use 'relu' for extra CPU speed
-    dropout: 0.08             # Reduced for tiny model
+    activation: gelu # Can use 'relu' for extra CPU speed
+    dropout: 0.08 # Reduced for tiny model
     classifier_hidden_dim: 128
     classifier_dropout: 0.20
   init:
@@ -125,20 +125,20 @@ model:
 # ------------------------------------------------------------------
 optim:
   name: adamw
-  lr: 0.0008                  # Higher LR for faster convergence with fewer params
-  weight_decay: 8.0e-5        # Slightly reduced weight decay
+  lr: 0.0008 # Higher LR for faster convergence with fewer params
+  weight_decay: 8.0e-5 # Slightly reduced weight decay
   betas: [0.9, 0.999]
   eps: 1.0e-8
   grad_clip_norm: 1.0
 
 scheduler:
   strategy: cosine
-  warmup_epochs: 4            # Longer warmup for stability
+  warmup_epochs: 4 # Longer warmup for stability
   min_lr_scale: 0.05
 
 training:
   unweighted_finetune_after_epoch: 15
-  epochs: 50                  # More epochs to compensate for capacity
+  epochs: 80 # More epochs to compensate for capacity
   batch_size: 1024
   eval_batch_size: 1024
   num_workers: 2
@@ -160,7 +160,7 @@ early_stopping:
   enabled: true
   metric: val/accuracy_top1
   mode: max
-  patience: 8                 # More patience for tiny model
+  patience: 8 # More patience for tiny model
   min_delta: 0.0005
 
 # ------------------------------------------------------------------
@@ -247,7 +247,6 @@ debug:
   limit_val_batches: null
   overfit_batches: 0
   deterministic_hash_check: false
-
 # ------------------------------------------------------------------
 # Notes
 # ------------------------------------------------------------------
