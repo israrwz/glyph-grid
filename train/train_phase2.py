@@ -171,7 +171,8 @@ def set_seed(seed: int, deterministic: bool = True):
 
 def _is_sequence_architecture(cfg: "Phase2Config") -> bool:
     """Check if config specifies sequence-aware architecture."""
-    arch = cfg.get("model", "architecture")
+    model_cfg = cfg.get("model", {})
+    arch = model_cfg.get("architecture", "transformer")
     return arch == "cnn_sequence"
 
 
@@ -1214,20 +1215,46 @@ def train_phase2(cfg: Phase2Config):
         )
 
         for step, batch in enumerate(train_loader):
-            grids, labels, glyph_ids, diacritic_flags = batch
+            # Unpack batch - handle both standard and sequence datasets
+            if len(batch) == 4:
+                # Standard dataset: (grids, labels, glyph_ids, diacritic_flags)
+                grids, labels, glyph_ids, diacritic_flags = batch
+                context_grids = None
+                context_deltas = None
+            else:
+                # Sequence dataset: (center_grids, context_grids, context_deltas, labels, glyph_ids, diacritic_flags)
+                (
+                    grids,
+                    context_grids,
+                    context_deltas,
+                    labels,
+                    glyph_ids,
+                    diacritic_flags,
+                ) = batch
+                context_grids = context_grids.to(device, non_blocking=True)
+                context_deltas = context_deltas.to(device, non_blocking=True)
+
             grids = grids.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
+
             # Token ID dropout augmentation
             if token_id_dropout > 0.0 and model.training:
                 # Replace a random subset of primitive IDs with 0 (EMPTY)
                 rand_mask = torch.rand_like(grids.float()) < token_id_dropout
                 if rand_mask.any():
                     grids = grids.masked_fill(rand_mask, 0)
+
             with torch.cuda.amp.autocast(
                 enabled=mixed_precision and device.type == "cuda"
             ):
                 # Handle sequence model outputs
-                output = model(grids)
+                if context_grids is not None:
+                    # Sequence-aware model
+                    output = model(grids, context_grids, context_deltas)
+                else:
+                    # Standard model
+                    output = model(grids)
+
                 if isinstance(output, tuple):
                     logits, _ = output
                 else:
