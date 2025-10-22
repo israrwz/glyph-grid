@@ -579,43 +579,21 @@ def convert_onnx_to_openvino(onnx_path: Path, output_dir: Path) -> Path:
             "OpenVINO is not available. Install with: pip install openvino"
         )
 
-    from openvino.tools import mo
-
     output_dir.mkdir(parents=True, exist_ok=True)
     xml_path = output_dir / "phase2_model.xml"
 
-    # Use Model Optimizer to convert ONNX to IR
-    import subprocess
-
-    cmd = [
-        "mo",
-        "--input_model",
-        str(onnx_path),
-        "--output_dir",
-        str(output_dir),
-        "--model_name",
-        "phase2_model",
-    ]
-
+    # Use direct Python API for conversion
     try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        from openvino import Core
+
+        ie = Core()
+        model = ie.read_model(model=str(onnx_path))
+        from openvino import serialize
+
+        serialize(model, str(xml_path))
         print(f"[INFO] Converted ONNX to OpenVINO IR: {xml_path}", flush=True)
-    except subprocess.CalledProcessError:
-        # Fallback: try direct conversion via Python API
-        try:
-            from openvino import Core
-
-            ie = Core()
-            model = ie.read_model(model=str(onnx_path))
-            from openvino import serialize
-
-            serialize(model, str(xml_path))
-            print(
-                f"[INFO] Converted ONNX to OpenVINO IR (via Python API): {xml_path}",
-                flush=True,
-            )
-        except Exception as e:
-            raise RuntimeError(f"Failed to convert ONNX to OpenVINO: {e}")
+    except Exception as e:
+        raise RuntimeError(f"Failed to convert ONNX to OpenVINO: {e}")
 
     return xml_path
 
