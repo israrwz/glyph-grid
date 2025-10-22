@@ -62,6 +62,14 @@ import torch
 from torch import nn
 import random
 
+# OpenVINO imports (optional)
+try:
+    from openvino import Core
+
+    OPENVINO_AVAILABLE = True
+except ImportError:
+    OPENVINO_AVAILABLE = False
+
 
 def set_seed(seed: int):
     random.seed(seed)
@@ -536,6 +544,171 @@ def predict_glyph_grid_batch(
 
 
 # ---------------------------------------------------------------------------
+# OpenVINO Inference
+# ---------------------------------------------------------------------------
+def export_phase2_to_onnx(
+    model: nn.Module,
+    onnx_path: Path,
+    batch_size: int = 1,
+) -> None:
+    """Export Phase 2 model to ONNX format."""
+    model.eval()
+    dummy_input = torch.randint(0, 1024, (batch_size, 16, 16), dtype=torch.long).to(
+        DEVICE
+    )
+
+    torch.onnx.export(
+        model,
+        dummy_input,
+        str(onnx_path),
+        input_names=["input"],
+        output_names=["output"],
+        dynamic_axes={
+            "input": {0: "batch_size"},
+            "output": {0: "batch_size"},
+        },
+        opset_version=11,
+    )
+    print(f"[INFO] Exported Phase 2 model to ONNX: {onnx_path}", flush=True)
+
+
+def convert_onnx_to_openvino(onnx_path: Path, output_dir: Path) -> Path:
+    """Convert ONNX model to OpenVINO IR format."""
+    if not OPENVINO_AVAILABLE:
+        raise RuntimeError(
+            "OpenVINO is not available. Install with: pip install openvino"
+        )
+
+    from openvino.tools import mo
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    xml_path = output_dir / "phase2_model.xml"
+
+    # Use Model Optimizer to convert ONNX to IR
+    import subprocess
+
+    cmd = [
+        "mo",
+        "--input_model",
+        str(onnx_path),
+        "--output_dir",
+        str(output_dir),
+        "--model_name",
+        "phase2_model",
+    ]
+
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        print(f"[INFO] Converted ONNX to OpenVINO IR: {xml_path}", flush=True)
+    except subprocess.CalledProcessError:
+        # Fallback: try direct conversion via Python API
+        try:
+            from openvino import Core
+
+            ie = Core()
+            model = ie.read_model(model=str(onnx_path))
+            from openvino import serialize
+
+            serialize(model, str(xml_path))
+            print(
+                f"[INFO] Converted ONNX to OpenVINO IR (via Python API): {xml_path}",
+                flush=True,
+            )
+        except Exception as e:
+            raise RuntimeError(f"Failed to convert ONNX to OpenVINO: {e}")
+
+    return xml_path
+
+
+class OpenVINOInferenceEngine:
+    """OpenVINO inference engine for Phase 2 model."""
+
+    def __init__(self, model_path: Path, device: str = "CPU"):
+        if not OPENVINO_AVAILABLE:
+            raise RuntimeError(
+                "OpenVINO is not available. Install with: pip install openvino"
+            )
+
+        self.ie = Core()
+        self.model = self.ie.read_model(model=str(model_path))
+        self.compiled_model = self.ie.compile_model(self.model, device)
+        self.infer_request = self.compiled_model.create_infer_request()
+
+        # Get input/output info
+        self.input_layer = self.compiled_model.input(0)
+        self.output_layer = self.compiled_model.output(0)
+
+        print(f"[INFO] OpenVINO model loaded on {device}", flush=True)
+
+    def predict_batch(
+        self,
+        grids: torch.Tensor,
+        topk: int = 5,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Batched inference using OpenVINO.
+
+        grids: (B, 16, 16) int64 primitive IDs
+        Returns:
+            topk_indices: (B, topk) int
+            topk_probs: (B, topk) float
+        """
+        if grids.ndim != 3 or grids.shape[1:] != (16, 16):
+            raise ValueError(
+                f"Expected grid shape (B, 16, 16); got {tuple(grids.shape)}"
+            )
+
+        # Convert to numpy and run inference
+        input_data = grids.cpu().numpy().astype(np.int64)
+        results = self.infer_request.infer({self.input_layer: input_data})
+        logits = results[self.output_layer]
+
+        # Compute softmax and top-k
+        logits_tensor = torch.from_numpy(logits)
+        probs = torch.softmax(logits_tensor, dim=1)
+        values, indices = torch.topk(probs, k=topk, dim=1)
+
+        return indices, values
+
+
+def setup_openvino_model(
+    phase2_model: nn.Module,
+    cache_dir: Path,
+    device: str = "CPU",
+) -> OpenVINOInferenceEngine:
+    """
+    Setup OpenVINO inference engine for Phase 2 model.
+    Exports to ONNX, converts to OpenVINO IR, and loads the model.
+    """
+    if not OPENVINO_AVAILABLE:
+        raise RuntimeError(
+            "OpenVINO is not available. Install with: pip install openvino openvino-dev"
+        )
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    onnx_path = cache_dir / "phase2_model.onnx"
+    ir_dir = cache_dir / "openvino_ir"
+
+    # Export to ONNX if not cached
+    if not onnx_path.exists():
+        print("[INFO] Exporting Phase 2 model to ONNX...", flush=True)
+        export_phase2_to_onnx(phase2_model, onnx_path, batch_size=1)
+    else:
+        print(f"[INFO] Using cached ONNX model: {onnx_path}", flush=True)
+
+    # Convert to OpenVINO IR if not cached
+    xml_path = ir_dir / "phase2_model.xml"
+    if not xml_path.exists():
+        print("[INFO] Converting ONNX to OpenVINO IR...", flush=True)
+        xml_path = convert_onnx_to_openvino(onnx_path, ir_dir)
+    else:
+        print(f"[INFO] Using cached OpenVINO IR: {xml_path}", flush=True)
+
+    # Load OpenVINO model
+    return OpenVINOInferenceEngine(xml_path, device=device)
+
+
+# ---------------------------------------------------------------------------
 # JSONL Writing
 # ---------------------------------------------------------------------------
 def write_jsonl(
@@ -682,6 +855,24 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--summary",
         action="store_true",
         help="Print summary metrics (top1 accuracy, top5 contains rate) after inference (raster mode only).",
+    )
+    ap.add_argument(
+        "--use-openvino",
+        action="store_true",
+        help="Use OpenVINO for Phase 2 inference acceleration (requires openvino package).",
+    )
+    ap.add_argument(
+        "--openvino-device",
+        type=str,
+        default="CPU",
+        choices=["CPU", "GPU", "AUTO"],
+        help="OpenVINO device target (default: CPU).",
+    )
+    ap.add_argument(
+        "--openvino-cache-dir",
+        type=Path,
+        default=Path("cache/openvino"),
+        help="Directory for OpenVINO model cache (default: cache/openvino).",
     )
     return ap.parse_args(argv)
 
@@ -938,6 +1129,39 @@ def main(argv: Optional[List[str]] = None) -> None:
                     missing_after = None
             except Exception:
                 pass
+
+    # ------------------------------------------------------------------
+    # OpenVINO Setup (if requested)
+    # ------------------------------------------------------------------
+    openvino_engine = None
+    if args.use_openvino:
+        if not OPENVINO_AVAILABLE:
+            print(
+                "[error] OpenVINO requested but not available. Install with: pip install openvino openvino-dev",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if phase2 is None:
+            print(
+                "[error] Phase 2 model not loaded; cannot setup OpenVINO.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        print(
+            f"[INFO] Setting up OpenVINO inference engine on {args.openvino_device}...",
+            flush=True,
+        )
+        try:
+            openvino_engine = setup_openvino_model(
+                phase2,
+                cache_dir=args.openvino_cache_dir,
+                device=args.openvino_device,
+            )
+            print("[INFO] OpenVINO engine ready.", flush=True)
+        except Exception as e:
+            print(f"[error] Failed to setup OpenVINO: {e}", file=sys.stderr)
+            sys.exit(1)
 
     # ------------------------------------------------------------------
     # Test split loading (glyph_id list) if requested
@@ -1204,9 +1428,16 @@ def main(argv: Optional[List[str]] = None) -> None:
             # Phase 2: Batch prediction
             try:
                 grids_tensor = torch.stack(batch_grids)  # (B, 16, 16)
-                batch_indices, batch_probs = predict_glyph_grid_batch(
-                    grids_tensor, phase2, topk=args.topk
-                )
+
+                # Use OpenVINO or PyTorch
+                if args.use_openvino and openvino_engine:
+                    batch_indices, batch_probs = openvino_engine.predict_batch(
+                        grids_tensor, topk=args.topk
+                    )
+                else:
+                    batch_indices, batch_probs = predict_glyph_grid_batch(
+                        grids_tensor, phase2, topk=args.topk
+                    )
 
                 # Process results
                 for i, (grid_idx, raster_path) in enumerate(
