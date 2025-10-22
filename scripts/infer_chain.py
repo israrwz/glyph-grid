@@ -1332,12 +1332,13 @@ def main(argv: Optional[List[str]] = None) -> None:
     # RASTER MODE
     # ------------------------------------------------------------------
     rasters: List[Path] = []
+    all_rasters_for_context: List[Path] = []
     if not memmap_mode:
-        rasters = sorted([p for p in args.rasters_dir.glob("*.png")])
+        all_rasters = sorted([p for p in args.rasters_dir.glob("*.png")])
         # Test split filtering (extract trailing numeric id)
         if test_ids_set:
             filtered = []
-            for rp in rasters:
+            for rp in all_rasters:
                 stem = rp.stem
                 # Expect last underscore component to be numeric glyph_id
                 parts = stem.rsplit("_", 1)
@@ -1346,6 +1347,12 @@ def main(argv: Optional[List[str]] = None) -> None:
                     if gid in test_ids_set:
                         filtered.append(rp)
             rasters = filtered
+        else:
+            rasters = all_rasters
+
+        # Keep all rasters for context lookup (before limiting)
+        all_rasters_for_context = rasters[:]
+
         if args.all_classes:
             per_label: Dict[str, List[Path]] = {}
             for rp in rasters:
@@ -1477,9 +1484,10 @@ def main(argv: Optional[List[str]] = None) -> None:
         num_rasters = len(rasters)
 
         # Build glyph_id -> raster_path mapping for sequence context
+        # Use ALL rasters (not just the limited subset) so neighbors can be found
         glyph_id_to_raster: Dict[int, Path] = {}
         if args.use_sequence_context and hasattr(phase2, "context_window"):
-            for raster_path in rasters:
+            for raster_path in all_rasters_for_context:
                 stem = raster_path.stem
                 # Extract glyph_id from filename (e.g., "78_latin_566636.png" -> 566636)
                 parts = stem.rsplit("_", 1)
@@ -1488,7 +1496,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                     glyph_id_to_raster[gid] = raster_path
             if glyph_id_to_raster:
                 print(
-                    f"[INFO] Sequence context enabled for raster mode: {len(glyph_id_to_raster)} rasters indexed",
+                    f"[INFO] Sequence context enabled for raster mode: {len(glyph_id_to_raster)} rasters indexed (inference on {len(rasters)} samples)",
                     flush=True,
                 )
 
